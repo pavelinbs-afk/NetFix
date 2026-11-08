@@ -268,7 +268,11 @@ public static class AutoDownloadService
                     }
 
                     onLog("Копирую файлы в C:\\Zapret (с заменой существующих)...");
-                    MoveDirectoryContents(tempInstallDir, mainInstallDir);
+                    if (!MoveDirectoryContents(tempInstallDir, mainInstallDir))
+                    {
+                        onError("❌ Не все файлы скопировались в C:\\Zapret. Установка прервана, чтобы не оставить смесь старых и новых бинарников.");
+                        return false;
+                    }
 
                     if (preservedFiles.Count > 0)
                     {
@@ -546,9 +550,10 @@ public static class AutoDownloadService
         }
     }
 
-    private static void MoveDirectoryContents(string sourceDir, string targetDir)
+    private static bool MoveDirectoryContents(string sourceDir, string targetDir)
     {
         Directory.CreateDirectory(targetDir);
+        bool allOk = true;
 
         foreach (var filePath in Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories))
         {
@@ -567,16 +572,21 @@ public static class AutoDownloadService
             }
             catch
             {
+                // раньше ошибка копирования просто проглатывалась
+                allOk = false;
             }
         }
+
+        return allOk;
     }
 
     private static bool IsInstallationSuccessful(string targetDir)
     {
         var serviceBat = FindFile(targetDir, "service.bat");
-        var tgwsProxy = FindFile(targetDir, "TgWsProxy.exe");
+        var winws = FindFile(targetDir, "winws.exe");
 
-        return !string.IsNullOrEmpty(serviceBat) || !string.IsNullOrEmpty(tgwsProxy);
+        // для Zapret нужны оба маркера, одного TgWsProxy недостаточно
+        return !string.IsNullOrEmpty(serviceBat) && !string.IsNullOrEmpty(winws);
     }
 
     private static async Task<ReleaseInfo?> GetLatestReleaseInfoAsync(string repo)

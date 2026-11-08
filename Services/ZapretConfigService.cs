@@ -409,70 +409,80 @@ public class ZapretConfigService
 
         try
         {
-            await Task.Delay(2000);
-            await process.StandardInput.WriteLineAsync("1");
-            await Task.Delay(1000);
-            await process.StandardInput.WriteLineAsync("2");
-            await Task.Delay(1000);
-
-            var configFiles = Directory.GetFiles(zapretDir, "*.bat")
-                .Where(f => !Path.GetFileName(f).StartsWith("service", StringComparison.OrdinalIgnoreCase))
-                .Select(Path.GetFileName)
-                .OrderBy(f => f, new NaturalStringComparer())
-                .ToList();
-
-            int configIndex = configFiles.IndexOf(configName) + 1;
-
-            for (int i = 0; i < configFiles.Count; i++)
+            try
             {
-            }
-
-            if (configIndex > 0)
-            {
-                await process.StandardInput.WriteLineAsync(configIndex.ToString());
+                await Task.Delay(2000);
+                await process.StandardInput.WriteLineAsync("1");
                 await Task.Delay(1000);
-            }
-            else
-            {
-                onProgress?.Invoke($"❌ Ошибка: не удалось найти конфиг {configName} в списке");
+                await process.StandardInput.WriteLineAsync("2");
+                await Task.Delay(1000);
+
+                var configFiles = Directory.GetFiles(zapretDir, "*.bat")
+                    .Where(f => !Path.GetFileName(f).StartsWith("service", StringComparison.OrdinalIgnoreCase))
+                    .Select(Path.GetFileName)
+                    .OrderBy(f => f, new NaturalStringComparer())
+                    .ToList();
+
+                int configIndex = configFiles.IndexOf(configName) + 1;
+
+                for (int i = 0; i < configFiles.Count; i++)
+                {
+                }
+
+                if (configIndex > 0)
+                {
+                    await process.StandardInput.WriteLineAsync(configIndex.ToString());
+                    await Task.Delay(1000);
+                }
+                else
+                {
+                    onProgress?.Invoke($"❌ Ошибка: не удалось найти конфиг {configName} в списке");
+                    // иначе powershell остаётся висеть и держит файлы
+                    try { process.StandardInput.Close(); } catch { }
+                    return (false, $"Не удалось найти конфиг {configName} в списке");
+                }
+
                 process.StandardInput.Close();
-                return (false, $"Не удалось найти конфиг {configName} в списке");
+            }
+            catch (IOException)
+            {
             }
 
-            process.StandardInput.Close();
-        }
-        catch (IOException)
-        {
-        }
+            await process.WaitForExitAsync();
 
-        await process.WaitForExitAsync();
-
-        if (currentConfig != null && foundTargetConfig)
-        {
-            currentConfig.IsValid = currentConfig.ErrorCount == 0 && currentConfig.SuccessCount == currentConfig.Tests.Count && currentConfig.Tests.Count > 0;
-
-            var successCount = currentConfig.SuccessCount;
-            var totalCount = currentConfig.Tests.Count;
-            var failedTests = totalCount - successCount;
-
-            if (currentConfig.IsValid)
+            if (currentConfig != null && foundTargetConfig)
             {
-                onProgress?.Invoke($"[HEADER]✅ {currentConfig.Name} - РАБОЧИЙ[/HEADER]");
-                onProgress?.Invoke($"   🔹 Протестировано: {successCount}/{totalCount}, Пинг: {currentConfig.AveragePing}мс");
-                return (true, $"Конфиг работает! Пройдено {successCount}/{totalCount} тестов");
+                currentConfig.IsValid = currentConfig.ErrorCount == 0 && currentConfig.SuccessCount == currentConfig.Tests.Count && currentConfig.Tests.Count > 0;
+
+                var successCount = currentConfig.SuccessCount;
+                var totalCount = currentConfig.Tests.Count;
+                var failedTests = totalCount - successCount;
+
+                if (currentConfig.IsValid)
+                {
+                    onProgress?.Invoke($"[HEADER]✅ {currentConfig.Name} - РАБОЧИЙ[/HEADER]");
+                    onProgress?.Invoke($"   🔹 Протестировано: {successCount}/{totalCount}, Пинг: {currentConfig.AveragePing}мс");
+                    return (true, $"Конфиг работает! Пройдено {successCount}/{totalCount} тестов");
+                }
+                else
+                {
+                    onProgress?.Invoke($"[HEADER]❌ {currentConfig.Name} - НЕРАБОЧИЙ[/HEADER]");
+                    onProgress?.Invoke($"   🔹 Протестировано: {successCount}/{totalCount}, Не работает: {failedTests} сайтов");
+                    return (false, $"Конфиг не проходит все тесты. Пройдено {successCount}/{totalCount}");
+                }
             }
             else
             {
-                onProgress?.Invoke($"[HEADER]❌ {currentConfig.Name} - НЕРАБОЧИЙ[/HEADER]");
-                onProgress?.Invoke($"   🔹 Протестировано: {successCount}/{totalCount}, Не работает: {failedTests} сайтов");
-                return (false, $"Конфиг не проходит все тесты. Пройдено {successCount}/{totalCount}");
+                onProgress?.Invoke($"❌ Ошибка: конфиг {configName} не был протестирован");
+                onProgress?.Invoke($"⚠️ ВОЗМОЖНО У ВАС ЗАПУЩЕН VPN! Закройте VPN и попробуйте ещё раз!");
+                return (false, $"Конфиг {configName} не был протестирован. Возможно, у вас запущен VPN - закройте его и попробуйте снова.");
             }
         }
-        else
+        finally
         {
-            onProgress?.Invoke($"❌ Ошибка: конфиг {configName} не был протестирован");
-            onProgress?.Invoke($"⚠️ ВОЗМОЖНО У ВАС ЗАПУЩЕН VPN! Закройте VPN и попробуйте ещё раз!");
-            return (false, $"Конфиг {configName} не был протестирован. Возможно, у вас запущен VPN - закройте его и попробуйте снова.");
+            // на любом выходе — не оставляем orphan powershell
+            try { if (!process.HasExited) process.Kill(true); } catch { }
+            process.Dispose();
         }
     }
 

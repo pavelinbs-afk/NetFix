@@ -370,3 +370,6 @@ NetFix_Setup*.iss
 # NetFix Fallback Binaries
 Assets/Fallback/zapret-fallback.zip
 Assets/Fallback/tgwsproxy-fallback.exe
+
+#cursor copied rules
+.cursor/

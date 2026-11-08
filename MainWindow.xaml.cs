@@ -1657,6 +1657,13 @@ public partial class MainWindow : Window
                 _ = AutoHostsModService.DownloadAutoModsFilesAsync(activeAutoMods).ContinueWith(t =>
                     Dispatcher.Invoke(() =>
                     {
+                        // без свежих авто-списков в hosts лучше ничего не писать
+                        if (t.IsFaulted || !t.Result)
+                        {
+                            ShowModsError("Не удалось загрузить авто-списки. Hosts не применены.");
+                            return;
+                        }
+
                         var (success, error) = ModActivator.ApplyHostsMods(allHosts);
                         if (!success)
                             ShowModsError(error ?? "Ошибка применения");
@@ -1685,12 +1692,23 @@ public partial class MainWindow : Window
             if (!ok) return;
 
             var allLists = _allMods.Where(m => m.Type == ModType.List).ToList();
-            ModActivator.ApplyListMods(allLists);
+            var (listOk, listErr) = ModActivator.ApplyListMods(allLists);
+            if (!listOk)
+            {
+                ShowModsError(listErr ?? "Ошибка применения списков");
+                return;
+            }
             _listsDirty = false;
 
             var allHosts = _allMods.Where(m => m.Type == ModType.Hosts).ToList();
-            ModActivator.ApplyHostsMods(allHosts);
+            var (hostsOk, hostsErr) = ModActivator.ApplyHostsMods(allHosts);
+            if (!hostsOk)
+            {
+                ShowModsError(hostsErr ?? "Ошибка применения hosts");
+                return;
+            }
             _hostsDirty = false;
+            ShowModsSuccess("Активные моды применены");
         }, confirmText: "Применить", confirmIsDestructive: false);
     }
 

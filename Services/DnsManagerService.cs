@@ -166,8 +166,14 @@ public static class DnsManagerService
                 return false;
             }
 
-            string interfaceName = activeInterface.Name;
-            string interfaceId = activeInterface.Id;
+            // в одинарных кавычках PS апостроф экранируется удвоением
+            string Q(string v) => (v ?? "").Replace("'", "''");
+
+            string interfaceName = Q(activeInterface.Name);
+            string interfaceId = Q(activeInterface.Id);
+            string primaryQ = Q(primary);
+            string secondaryQ = Q(secondary);
+            string dohQ = Q(dohTemplate);
             string psCommand;
 
             if (primary == "dhcp")
@@ -179,27 +185,27 @@ public static class DnsManagerService
             }
             else
             {
-                string addresses = string.IsNullOrEmpty(secondary) ? $"'{primary}'" : $"'{primary}', '{secondary}'";
+                string addresses = string.IsNullOrEmpty(secondary) ? $"'{primaryQ}'" : $"'{primaryQ}', '{secondaryQ}'";
                 psCommand = $"Set-DnsClientServerAddress -InterfaceAlias '{interfaceName}' -ServerAddresses ({addresses})";
 
                 if (!string.IsNullOrEmpty(dohTemplate))
                 {
                     psCommand += $"; if (Get-Command Add-DnsClientDohServerAddress -ErrorAction SilentlyContinue) {{" +
-                                 $" Add-DnsClientDohServerAddress -ServerAddress '{primary}' -DohTemplate '{dohTemplate}' -AllowFallbackToUdp $False -AutoUpgrade $True -ErrorAction SilentlyContinue";
+                                 $" Add-DnsClientDohServerAddress -ServerAddress '{primaryQ}' -DohTemplate '{dohQ}' -AllowFallbackToUdp $False -AutoUpgrade $True -ErrorAction SilentlyContinue";
                     if (!string.IsNullOrEmpty(secondary))
                     {
-                        psCommand += $"; Add-DnsClientDohServerAddress -ServerAddress '{secondary}' -DohTemplate '{dohTemplate}' -AllowFallbackToUdp $False -AutoUpgrade $True -ErrorAction SilentlyContinue";
+                        psCommand += $"; Add-DnsClientDohServerAddress -ServerAddress '{secondaryQ}' -DohTemplate '{dohQ}' -AllowFallbackToUdp $False -AutoUpgrade $True -ErrorAction SilentlyContinue";
                     }
                     psCommand += " }";
 
                     string regPath = $"HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\InterfaceSpecificParameters\\{interfaceId}";
-                    psCommand += $"; if (!(Test-Path '{regPath}\\DohInterfaceSettings\\Doh\\{primary}')) {{ New-Item -Path '{regPath}\\DohInterfaceSettings\\Doh\\{primary}' -Force | Out-Null }}";
-                    psCommand += $"; New-ItemProperty -Path '{regPath}\\DohInterfaceSettings\\Doh\\{primary}' -Name 'DohFlags' -Value 1 -PropertyType QWord -Force | Out-Null";
+                    psCommand += $"; if (!(Test-Path '{regPath}\\DohInterfaceSettings\\Doh\\{primaryQ}')) {{ New-Item -Path '{regPath}\\DohInterfaceSettings\\Doh\\{primaryQ}' -Force | Out-Null }}";
+                    psCommand += $"; New-ItemProperty -Path '{regPath}\\DohInterfaceSettings\\Doh\\{primaryQ}' -Name 'DohFlags' -Value 1 -PropertyType QWord -Force | Out-Null";
 
                     if (!string.IsNullOrEmpty(secondary))
                     {
-                        psCommand += $"; if (!(Test-Path '{regPath}\\DohInterfaceSettings\\Doh\\{secondary}')) {{ New-Item -Path '{regPath}\\DohInterfaceSettings\\Doh\\{secondary}' -Force | Out-Null }}";
-                        psCommand += $"; New-ItemProperty -Path '{regPath}\\DohInterfaceSettings\\Doh\\{secondary}' -Name 'DohFlags' -Value 1 -PropertyType QWord -Force | Out-Null";
+                        psCommand += $"; if (!(Test-Path '{regPath}\\DohInterfaceSettings\\Doh\\{secondaryQ}')) {{ New-Item -Path '{regPath}\\DohInterfaceSettings\\Doh\\{secondaryQ}' -Force | Out-Null }}";
+                        psCommand += $"; New-ItemProperty -Path '{regPath}\\DohInterfaceSettings\\Doh\\{secondaryQ}' -Name 'DohFlags' -Value 1 -PropertyType QWord -Force | Out-Null";
                     }
                 }
 

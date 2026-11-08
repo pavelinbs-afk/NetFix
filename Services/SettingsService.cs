@@ -57,10 +57,20 @@ public static class SettingsService
         catch { return new(); }
     }
 
-    public static void Save(AppSettings s)
+    public static bool Save(AppSettings s)
     {
-        try { File.WriteAllText(SettingsFile, JsonSerializer.Serialize(s, JsonOpts)); }
-        catch { }
+        try
+        {
+            Directory.CreateDirectory(AppDir);
+            File.WriteAllText(SettingsFile, JsonSerializer.Serialize(s, JsonOpts));
+            return true;
+        }
+        catch (Exception ex)
+        {
+            // пустой catch прятал потерю настроек — хотя бы видно в Debug
+            System.Diagnostics.Debug.WriteLine($"Settings save failed: {ex.Message}");
+            return false;
+        }
     }
 
     public static bool IsOnboarded => File.Exists(OnboardFile);
@@ -104,8 +114,7 @@ public static class SettingsService
 
             if (settings == null) return false;
 
-            Save(settings);
-            return true;
+            return Save(settings);
         }
         catch
         {
