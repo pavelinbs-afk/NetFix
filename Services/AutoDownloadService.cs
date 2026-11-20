@@ -38,53 +38,23 @@ public static class AutoDownloadService
             bool zapretWasRunning = false;
             bool tgWsProxyWasRunning = false;
 
-            var winwsProcesses = System.Diagnostics.Process.GetProcessesByName("winws");
-            if (winwsProcesses.Length > 0)
+            if (await ZapretConfigService.IsZapretUpAsync())
             {
                 zapretWasRunning = true;
-                onLog($"⚠️ Обнаружено {winwsProcesses.Length} процессов winws.exe (Zapret)");
-                onLog("Останавливаю Zapret...");
-
-                foreach (var proc in winwsProcesses)
-                {
-                    try
-                    {
-                        proc.Kill(true);
-                        proc.WaitForExit(3000);
-                        proc.Dispose();
-                    }
-                    catch (Exception ex)
-                    {
-                        onLog($"⚠️ Не удалось остановить процесс winws.exe (PID {proc.Id}): {ex.Message}");
-                    }
-                }
-
-                await Task.Delay(1000);
+                onLog("⚠️ Zapret запущен — останавливаю перед обновлением...");
+                ZapretConfigService.KillWinwsProcesses();
+                await ProcessRunner.RunAsync("sc", "stop zapret", 8000);
+                await Task.Delay(800);
                 onLog("✅ Zapret остановлен");
             }
 
-            var tgWsProxyProcesses = System.Diagnostics.Process.GetProcessesByName("TgWsProxy");
-            if (tgWsProxyProcesses.Length > 0)
+            if (System.Diagnostics.Process.GetProcessesByName("TgWsProxy").Length > 0
+                || System.Diagnostics.Process.GetProcessesByName("tgwsproxy").Length > 0)
             {
                 tgWsProxyWasRunning = true;
-                onLog($"⚠️ Обнаружено {tgWsProxyProcesses.Length} процессов TgWsProxy.exe");
-                onLog("Останавливаю TgWsProxy...");
-
-                foreach (var proc in tgWsProxyProcesses)
-                {
-                    try
-                    {
-                        proc.Kill(true);
-                        proc.WaitForExit(3000);
-                        proc.Dispose();
-                    }
-                    catch (Exception ex)
-                    {
-                        onLog($"⚠️ Не удалось остановить процесс TgWsProxy.exe (PID {proc.Id}): {ex.Message}");
-                    }
-                }
-
-                await Task.Delay(1000);
+                onLog("⚠️ TgWsProxy запущен — останавливаю перед обновлением...");
+                ZapretConfigService.KillTgWsProcesses();
+                await Task.Delay(800);
                 onLog("✅ TgWsProxy остановлен");
             }
 
@@ -477,8 +447,28 @@ public static class AutoDownloadService
 
                 if (zapretWasRunning)
                 {
-                    onLog("ℹ️ Zapret был остановлен для обновления");
-                    onLog("Вы можете запустить его через панель сервисов или service.bat");
+                    onLog("Перезапускаю Zapret...");
+                    try
+                    {
+                        var cache = ZapretConfigService.LoadCache();
+                        var zapretPath = !string.IsNullOrEmpty(settings.ZapretPath) && File.Exists(settings.ZapretPath)
+                            ? settings.ZapretPath
+                            : Path.Combine(InstallDir, "service.bat");
+
+                        if (!string.IsNullOrEmpty(cache?.CurrentConfig) && File.Exists(zapretPath))
+                        {
+                            bool ok = await ZapretConfigService.ApplyConfigAsync(zapretPath, cache.CurrentConfig);
+                            onLog(ok ? "✅ Zapret перезапущен" : "⚠️ Zapret не поднялся — запусти из панели сервисов");
+                        }
+                        else
+                        {
+                            onLog("ℹ️ Нет сохранённого конфига — запусти Zapret из панели сервисов");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        onLog($"⚠️ Не удалось перезапустить Zapret: {ex.Message}");
+                    }
                 }
 
                 if (tgWsProxyWasRunning && !string.IsNullOrEmpty(tgWsExe))
@@ -491,12 +481,14 @@ public static class AutoDownloadService
                             UseShellExecute = true,
                             WorkingDirectory = Path.GetDirectoryName(tgWsExe)
                         });
-                        onLog("✅ TgWsProxy перезапущен");
+                        await Task.Delay(1200);
+                        bool up = System.Diagnostics.Process.GetProcessesByName("TgWsProxy").Length > 0
+                                  || System.Diagnostics.Process.GetProcessesByName("tgwsproxy").Length > 0;
+                        onLog(up ? "✅ TgWsProxy перезапущен" : "⚠️ TgWsProxy не поднялся — запусти вручную");
                     }
                     catch (Exception ex)
                     {
                         onLog($"⚠️ Не удалось перезапустить TgWsProxy: {ex.Message}");
-                        onLog("Вы можете запустить его вручную через панель сервисов");
                     }
                 }
 
@@ -572,7 +564,6 @@ public static class AutoDownloadService
             }
             catch
             {
-                // раньше ошибка копирования просто проглатывалась
                 allOk = false;
             }
         }
@@ -585,7 +576,6 @@ public static class AutoDownloadService
         var serviceBat = FindFile(targetDir, "service.bat");
         var winws = FindFile(targetDir, "winws.exe");
 
-        // для Zapret нужны оба маркера, одного TgWsProxy недостаточно
         return !string.IsNullOrEmpty(serviceBat) && !string.IsNullOrEmpty(winws);
     }
 

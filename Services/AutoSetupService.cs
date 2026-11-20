@@ -47,9 +47,16 @@ public static class AutoSetupService
         string tgWsVer     = settings.EnableTgWsProxy ? await GetLatestGitHubRelease(TgWsProxyRepo) : "";
         progress(0.20);
 
+        bool wantZapret = settings.EnableZapret
+            && !string.IsNullOrEmpty(settings.ZapretPath)
+            && File.Exists(settings.ZapretPath);
+        bool wantTg = settings.EnableTgWsProxy
+            && !string.IsNullOrEmpty(settings.TgWsProxyPath)
+            && File.Exists(settings.TgWsProxyPath);
+
         if (settings.EnableZapret)
         {
-            if (string.IsNullOrEmpty(settings.ZapretPath) || !File.Exists(settings.ZapretPath))
+            if (!wantZapret)
             {
                 log($"Нахожу Zapret {(string.IsNullOrEmpty(zapretVer) ? "последнюю версию" : zapretVer)}…", "info");
                 log($"Откройте в браузере и скачайте архив для Windows:\nhttps://github.com/{ZapretRepo}/releases/latest", "link");
@@ -58,10 +65,35 @@ public static class AutoSetupService
             else
             {
                 log($"Zapret найден: {settings.ZapretPath}", "ok");
-                if (!IsProcessRunning(["zapret", "nfqws", "winws"]))
-                    TryLaunch(settings.ZapretPath, log);
-                else
+                if (await ZapretConfigService.IsZapretUpAsync())
+                {
                     log("Zapret уже запущен", "ok");
+                }
+                else
+                {
+                    var isServiceBat = Path.GetFileName(settings.ZapretPath)
+                        .Equals("service.bat", StringComparison.OrdinalIgnoreCase);
+                    if (isServiceBat)
+                    {
+                        var cache = ZapretConfigService.LoadCache() ?? new ZapretConfigCache();
+                        log($"Запускаю Zapret ({cache.CurrentConfig ?? "авто"})…", "info");
+
+                        var (ok, used) = await ZapretConfigService.TryStartBestConfigAsync(
+                            settings.ZapretPath,
+                            cache,
+                            name => log($"Пробую конфиг «{name}»…", "info"));
+
+                        if (ok)
+                            log($"Zapret запущен{(string.IsNullOrEmpty(used) ? "" : $" («{used}»)")}", "ok");
+                        else
+                            log("Не удалось запустить Zapret", "warn");
+                    }
+                    else
+                    {
+                        TryLaunch(settings.ZapretPath, log);
+                        await WaitForProcessAsync(["winws", "nfqws"], 4000);
+                    }
+                }
             }
         }
         else
@@ -73,7 +105,7 @@ public static class AutoSetupService
 
         if (settings.EnableTgWsProxy)
         {
-            if (string.IsNullOrEmpty(settings.TgWsProxyPath) || !File.Exists(settings.TgWsProxyPath))
+            if (!wantTg)
             {
                 log($"Нахожу tg-ws-proxy {(string.IsNullOrEmpty(tgWsVer) ? "последнюю версию" : tgWsVer)}…", "info");
                 log($"Откройте в браузере и скачайте для Windows:\nhttps://github.com/{TgWsProxyRepo}/releases/latest", "link");
@@ -82,10 +114,13 @@ public static class AutoSetupService
             else
             {
                 log($"tg-ws-proxy найден: {settings.TgWsProxyPath}", "ok");
-                if (!IsProcessRunning(["tg-ws-proxy", "tgwsproxy"]))
-                    TryLaunch(settings.TgWsProxyPath, log);
-                else
+                if (IsProcessRunning(["tg-ws-proxy", "tgwsproxy", "tg_ws_proxy"]))
                     log("tg-ws-proxy уже запущен", "ok");
+                else
+                {
+                    TryLaunch(settings.TgWsProxyPath, log);
+                    await WaitForProcessAsync(["tg-ws-proxy", "tgwsproxy", "tg_ws_proxy"], 4000);
+                }
             }
         }
         else
@@ -95,13 +130,43 @@ public static class AutoSetupService
         progress(0.75);
         await Task.Delay(200);
 
-        log("", "spacer");
-        progress(1.0);
-        await Task.Delay(200);
+        // не пишем «готово», если winws мёртв
+        var st = await DiagnosticsEngine.CheckAppStatusAsync();
+        bool zapretOk = !wantZapret || st.ZapretRunning;
+        bool tgOk = !wantTg || st.TgWsProxyRunning;
+        bool allOk = zapretOk && tgOk;
 
         log("", "spacer");
-        log("Готово! Telegram должен работать нормально.", "success");
-        done(true, "ok");
+        progress(1.0);
+        await Task.Delay(150);
+
+        if (allOk)
+        {
+            if (wantTg)
+                log("Готово! Telegram должен работать нормально.", "success");
+            else if (wantZapret)
+                log("Готово! Zapret поднят.", "success");
+            else
+                log("Готово.", "success");
+            done(true, "ok");
+        }
+        else
+        {
+            if (!zapretOk) log("Zapret так и не поднялся — проверьте конфиг или вкладку сервисов.", "warn");
+            if (!tgOk) log("TgWsProxy так и не поднялся — проверьте путь в настройках.", "warn");
+            log("Автонастройка завершилась с ошибками.", "error");
+            done(false, "partial");
+        }
+    }
+
+    private static async Task WaitForProcessAsync(string[] keywords, int timeoutMs)
+    {
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            if (IsProcessRunning(keywords)) return;
+            await Task.Delay(250);
+        }
     }
 
     private static async Task<string> GetLatestGitHubRelease(string repo)
@@ -122,7 +187,15 @@ public static class AutoSetupService
         try
         {
             return Process.GetProcesses()
-                .Any(p => { try { return keywords.Any(k => p.ProcessName.ToLower().Contains(k)); } catch { return false; } });
+                .Any(p =>
+                {
+                    try
+                    {
+                        var n = p.ProcessName.ToLowerInvariant();
+                        return keywords.Any(k => n.Contains(k.ToLowerInvariant()));
+                    }
+                    catch { return false; }
+                });
         }
         catch { return false; }
     }

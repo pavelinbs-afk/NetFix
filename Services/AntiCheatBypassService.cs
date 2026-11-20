@@ -34,11 +34,7 @@ public static class AntiCheatBypassService
         await RunCommandAsync("sc", "stop zapret");
         await Task.Delay(200);
 
-        foreach (var proc in Process.GetProcessesByName("winws"))
-            try { proc.Kill(); } catch { }
-
-        foreach (var proc in Process.GetProcessesByName("winws.exe"))
-            try { proc.Kill(); } catch { }
+        ZapretConfigService.KillWinwsProcesses();
 
         await RunCommandAsync("sc", "stop windivert");
         await RunCommandAsync("sc", "stop windivert14");
@@ -49,45 +45,29 @@ public static class AntiCheatBypassService
     {
         var settings = SettingsService.Load();
         var path = !string.IsNullOrEmpty(zapretPath) ? zapretPath : settings.ZapretPath;
-
-        if (string.IsNullOrEmpty(path) || !File.Exists(path))
-        {
-            await RunCommandAsync("sc", "start zapret");
-            return true;
-        }
-
-        var isServiceBat = Path.GetFileName(path).Equals("service.bat", StringComparison.OrdinalIgnoreCase);
         var cache = ZapretConfigService.LoadCache();
 
-        if (isServiceBat && cache is { HasAnyConfigs: true, CurrentConfig: { Length: > 0 } })
+        if (!string.IsNullOrEmpty(path) && File.Exists(path)
+            && cache is { CurrentConfig.Length: > 0 })
         {
-            return await ZapretConfigService.ApplyConfigAsync(path, cache.CurrentConfig);
+            return await ZapretConfigService.ApplyConfigAsync(path, cache.CurrentConfig)
+                .ConfigureAwait(false);
         }
 
         await RunCommandAsync("sc", "start zapret");
-        return true;
+        for (int i = 0; i < 10; i++)
+        {
+            await Task.Delay(300).ConfigureAwait(false);
+            if (await ZapretConfigService.IsZapretUpAsync().ConfigureAwait(false))
+                return true;
+        }
+
+        return false;
     }
 
-    public static async Task RunCommandAsync(string fileName, string args)
+    public static async Task RunCommandAsync(string fileName, string args, int timeoutMs = 10000)
     {
-        try
-        {
-            var psi = new ProcessStartInfo
-            {
-                FileName = fileName,
-                Arguments = args,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = false
-            };
-            using var proc = Process.Start(psi);
-            if (proc != null)
-            {
-                await proc.WaitForExitAsync();
-            }
-        }
-        catch { }
+        await ProcessRunner.RunAsync(fileName, args, timeoutMs).ConfigureAwait(false);
     }
 
     public static void StartWatcher(Action<string>? onBypassTriggered = null)

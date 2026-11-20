@@ -4,6 +4,7 @@ using System.Net.Http;
 using System.Net.NetworkInformation;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using NetFix.Models;
 
@@ -35,12 +36,12 @@ public static class DiagnosticsEngine
 
     private static readonly Dictionary<string, string[]> AppSignatures = new()
     {
-        ["telegram"]   = ["telegram", "tgram", "gram", "aygram"],
-        ["discord"]    = ["discord", "cord"],
-        ["zapret"]     = ["zapret", "nfqws", "windivert", "winws"],
+        ["telegram"]   = ["telegram", "tgram", "aygram"],
+        ["discord"]    = ["discord"],
+        // zapret смотрим отдельно по winws/nfqws
         ["goodbyedpi"] = ["goodbyedpi", "goodbye"],
-        ["warp"]       = ["warp-svc", "warp-cli", "cloudflare"],
-        ["tgwsproxy"]  = ["tg-ws-proxy", "tgwsproxy", "tg_ws_proxy", "flowseal"],
+        ["warp"]       = ["warp-svc", "warp-cli", "cloudflarewarp"],
+        ["tgwsproxy"]  = ["tg-ws-proxy", "tgwsproxy", "tg_ws_proxy"],
     };
 
 
@@ -216,21 +217,168 @@ public static class DiagnosticsEngine
         try
         {
             var names = Process.GetProcesses()
-                .Select(p => { try { return p.ProcessName.ToLower(); } catch { return ""; } })
-                .Where(n => n.Length > 0).ToList();
+                .Select(p => { try { return p.ProcessName.ToLowerInvariant(); } catch { return ""; } })
+                .Where(n => n.Length > 0)
+                .ToList();
 
             string Match(string key) =>
                 names.FirstOrDefault(n => AppSignatures[key].Any(s => n.Contains(s))) ?? "";
 
             var tg = Match("telegram"); if (tg != "") { status.TelegramRunning = true; status.TelegramProcName = tg; }
             var dc = Match("discord");  if (dc != "") { status.DiscordRunning = true;  status.DiscordProcName = dc; }
-            var zp = Match("zapret");   if (zp != "") { status.ZapretRunning = true;   status.ZapretProcName = zp; }
             var gd = Match("goodbyedpi"); if (gd != "") { status.GoodbyeDpiRunning = true; status.GoodbyeDpiProcName = gd; }
             var wp = Match("warp");     if (wp != "") { status.WarpRunning = true;     status.WarpProcName = wp; }
             var tw = Match("tgwsproxy"); if (tw != "") { status.TgWsProxyRunning = true; status.TgWsProxyProcName = tw; }
+
+            // Zapret = живой winws/nfqws, не драйвер WinDivert
+            if (names.Contains("winws"))
+            {
+                status.ZapretRunning = true;
+                status.ZapretProcName = "winws";
+            }
+            else if (names.Contains("nfqws"))
+            {
+                status.ZapretRunning = true;
+                status.ZapretProcName = "nfqws";
+            }
         }
         catch { }
         return status;
+    }
+
+    public static Task<AppStatus> CheckAppStatusAsync()
+        => Task.FromResult(CheckAppStatus());
+
+    // hyper-v/docker и прочий мусор — это не VPN
+    private static readonly string[] VpnExcludeKw =
+    [
+        "hyper-v", "vethernet", "vmware", "virtualbox", "vbox", "docker",
+        "loopback", "npcap", "winpcap", "pseudo-interface", "isatap", "teredo", "6to4"
+    ];
+
+    private static readonly string[] VpnNameHints =
+    [
+        "wireguard", "wintun", "nordvpn", "expressvpn", "openvpn", "outline",
+        "mullvad", "proton", "surfshark", "fortigate", "tap-windows", "tap-win",
+        "cloudflare", "warp", "amnezia", "happ", "needvpn", "softether",
+        "tailscale", "zerotier", "ipsec", "sstp", "l2tp", "pptp", "tun", "tap", "vpn"
+    ];
+
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern uint GetBestInterface(uint dwDestAddr, out uint pdwBestIfIndex);
+
+    // смотрим куда уходит трафик, а не имена процессов
+    public static bool DetectVpn(out string info)
+    {
+        info = "";
+        try
+        {
+            uint bestIf = 0;
+            bool haveBest = GetBestInterface(0x08080808, out bestIf) == 0 && bestIf > 0;
+
+            NetworkInterface? egress = null;
+            var up = new List<NetworkInterface>();
+
+            foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                up.Add(ni);
+
+                try
+                {
+                    var idx = (uint)(ni.GetIPProperties().GetIPv4Properties()?.Index ?? 0);
+                    if (haveBest && idx == bestIf)
+                        egress = ni;
+                }
+                catch { }
+            }
+
+            if (egress is not null && IsVpnEgressAdapter(egress, out info))
+                return true;
+
+            // туннель забрал default route, а обычный Ethernet/Wi‑Fi всё ещё up
+            if (egress is not null && IsTunnelLike(egress) && !IsExcludedVirtual(egress))
+            {
+                bool hasPhysical = up.Any(n =>
+                {
+                    if (n.Id == egress.Id || IsTunnelLike(n) || IsExcludedVirtual(n))
+                        return false;
+                    return n.NetworkInterfaceType is NetworkInterfaceType.Ethernet
+                        or NetworkInterfaceType.Wireless80211;
+                });
+
+                if (hasPhysical)
+                {
+                    info = egress.Name;
+                    return true;
+                }
+            }
+
+            foreach (var ni in up)
+            {
+                if (!IsTunnelLike(ni) || IsExcludedVirtual(ni)) continue;
+                try
+                {
+                    var props = ni.GetIPProperties();
+                    bool hasIpv4 = props.UnicastAddresses.Any(u =>
+                        u.Address.AddressFamily == AddressFamily.InterNetwork);
+                    bool hasGw = props.GatewayAddresses.Any(g =>
+                        g.Address.AddressFamily == AddressFamily.InterNetwork
+                        && !IPAddress.IsLoopback(g.Address));
+                    if (hasIpv4 && (hasGw || (haveBest && IsSameIf(ni, bestIf))))
+                    {
+                        info = ni.Name;
+                        return true;
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+
+        return false;
+    }
+
+    private static bool IsSameIf(NetworkInterface ni, uint ifIndex)
+    {
+        try
+        {
+            var idx = (uint)(ni.GetIPProperties().GetIPv4Properties()?.Index ?? 0);
+            return idx == ifIndex && ifIndex > 0;
+        }
+        catch { return false; }
+    }
+
+    private static bool IsTunnelLike(NetworkInterface ni)
+        => ni.NetworkInterfaceType is NetworkInterfaceType.Ppp or NetworkInterfaceType.Tunnel;
+
+    private static bool IsExcludedVirtual(NetworkInterface ni)
+    {
+        var label = $"{ni.Name} {ni.Description}".ToLowerInvariant();
+        return VpnExcludeKw.Any(k => label.Contains(k));
+    }
+
+    private static bool IsVpnEgressAdapter(NetworkInterface ni, out string info)
+    {
+        info = "";
+        if (IsExcludedVirtual(ni)) return false;
+
+        var label = $"{ni.Name} {ni.Description}".ToLowerInvariant();
+
+        if (VpnNameHints.Any(k => label.Contains(k)))
+        {
+            info = ni.Name;
+            return true;
+        }
+
+        if (IsTunnelLike(ni))
+        {
+            info = ni.Name;
+            return true;
+        }
+
+        return false;
     }
 
 

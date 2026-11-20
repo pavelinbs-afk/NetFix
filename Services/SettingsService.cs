@@ -67,8 +67,7 @@ public static class SettingsService
         }
         catch (Exception ex)
         {
-            // пустой catch прятал потерю настроек — хотя бы видно в Debug
-            System.Diagnostics.Debug.WriteLine($"Settings save failed: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine($"Не сохранил настройки: {ex.Message}");
             return false;
         }
     }

@@ -129,29 +129,19 @@ public partial class ZapretConfigWindow : Window
                 _testProcess.Dispose();
             }
             catch { }
+            _testProcess = null;
         }
 
-        if (_testMode)
+        // после Apply winws оставляем — иначе на главной мигает статус
+        if (_testMode && !ConfigWasApplied)
         {
             try
             {
-                var processes = Process.GetProcessesByName("winws");
-                foreach (var proc in processes)
+                foreach (var proc in Process.GetProcessesByName("winws"))
                 {
                     try
                     {
                         ForceKillProcessTree(proc.Id);
-                        proc.Dispose();
-                    }
-                    catch { }
-                }
-
-                var powerShellProcs = Process.GetProcessesByName("powershell");
-                foreach (var proc in powerShellProcs)
-                {
-                    try
-                    {
-                        proc.Kill(true);
                         proc.Dispose();
                     }
                     catch { }
@@ -267,10 +257,7 @@ public partial class ZapretConfigWindow : Window
         if (st.ZapretRunning)
         {
             StatusText.Text = "Остановка Zapret...";
-            foreach (var p in Process.GetProcessesByName("winws"))
-                try { p.Kill(); } catch { }
-            foreach (var p in Process.GetProcessesByName("winws.exe"))
-                try { p.Kill(); } catch { }
+            ZapretConfigService.KillWinwsProcesses();
 
             await Task.Delay(1000);
         }
@@ -279,48 +266,14 @@ public partial class ZapretConfigWindow : Window
         {
             StatusText.Text = "Удаление сервиса Zapret...";
 
-            var psi = new ProcessStartInfo
+            var (queryCode, _) = await ProcessRunner.RunAsync("sc.exe", "query zapret", 5000);
+            if (queryCode == 0)
             {
-                FileName = "sc.exe",
-                Arguments = "query zapret",
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
-            using var checkProcess = Process.Start(psi);
-            if (checkProcess != null)
-            {
-                await checkProcess.WaitForExitAsync();
-
-                if (checkProcess.ExitCode == 0)
-                {
-                    var stopPsi = new ProcessStartInfo
-                    {
-                        FileName = "net.exe",
-                        Arguments = "stop zapret",
-                        UseShellExecute = false,
-                        CreateNoWindow = true
-                    };
-                    using var stopProcess = Process.Start(stopPsi);
-                    if (stopProcess != null)
-                        await stopProcess.WaitForExitAsync();
-
-                    await Task.Delay(500);
-
-                    var deletePsi = new ProcessStartInfo
-                    {
-                        FileName = "sc.exe",
-                        Arguments = "delete zapret",
-                        UseShellExecute = false,
-                        CreateNoWindow = true
-                    };
-                    using var deleteProcess = Process.Start(deletePsi);
-                    if (deleteProcess != null)
-                        await deleteProcess.WaitForExitAsync();
-
-                    await Task.Delay(500);
-                }
+                ZapretConfigService.KillWinwsProcesses();
+                await ProcessRunner.RunAsync("sc.exe", "stop zapret", 8000);
+                await Task.Delay(400);
+                await ProcessRunner.RunAsync("sc.exe", "delete zapret", 8000);
+                await Task.Delay(400);
             }
         }
         catch
@@ -747,23 +700,11 @@ public partial class ZapretConfigWindow : Window
 
             try
             {
-                var processes = Process.GetProcessesByName("winws");
-                foreach (var proc in processes)
+                foreach (var proc in Process.GetProcessesByName("winws"))
                 {
                     try
                     {
                         ForceKillProcessTree(proc.Id);
-                        proc.Dispose();
-                    }
-                    catch { }
-                }
-
-                var powerShellProcs = Process.GetProcessesByName("powershell");
-                foreach (var proc in powerShellProcs)
-                {
-                    try
-                    {
-                        proc.Kill(true);
                         proc.Dispose();
                     }
                     catch { }

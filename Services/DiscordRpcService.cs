@@ -8,7 +8,7 @@ public class DiscordRpcService : IDisposable
     private DiscordRpcClient? _client;
     private readonly DateTime _startTime = DateTime.UtcNow;
     private int _ping;
-    private bool _enabled = true;
+    private bool _enabled;
 
     public bool IsPriorityMode { get; set; } = false;
     public bool IsScanning { get; set; } = false;
@@ -16,27 +16,35 @@ public class DiscordRpcService : IDisposable
 
     public void Initialize()
     {
-        if (!_enabled) return;
-        _client = new DiscordRpcClient(APP_ID);
-        _client.Logger = new ConsoleLogger { Level = LogLevel.Warning };
-        _client.OnReady += (sender, e) => { };
-        _client.Initialize();
-        SetMainMenu();
+        if (_client != null) return;
+        _enabled = true;
+        try
+        {
+            _client = new DiscordRpcClient(APP_ID);
+            _client.Logger = new ConsoleLogger { Level = LogLevel.Warning };
+            _client.OnReady += (sender, e) => { };
+            _client.Initialize();
+            SetMainMenu();
+        }
+        catch
+        {
+            _client?.Dispose();
+            _client = null;
+            _enabled = false;
+        }
     }
 
     public void Enable()
     {
-        if (_enabled) return;
-        _enabled = true;
+        if (_enabled && _client != null) return;
         Initialize();
     }
 
     public void Disable()
     {
-        if (!_enabled) return;
         _enabled = false;
-        _client?.ClearPresence();
-        _client?.Dispose();
+        try { _client?.ClearPresence(); } catch { }
+        try { _client?.Dispose(); } catch { }
         _client = null;
     }
 

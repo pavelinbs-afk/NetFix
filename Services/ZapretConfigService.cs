@@ -4,9 +4,11 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using Microsoft.Win32;
 using NetFix.Models;
 
 namespace NetFix.Services;
@@ -437,7 +439,6 @@ public class ZapretConfigService
                 else
                 {
                     onProgress?.Invoke($"❌ Ошибка: не удалось найти конфиг {configName} в списке");
-                    // иначе powershell остаётся висеть и держит файлы
                     try { process.StandardInput.Close(); } catch { }
                     return (false, $"Не удалось найти конфиг {configName} в списке");
                 }
@@ -480,7 +481,6 @@ public class ZapretConfigService
         }
         finally
         {
-            // на любом выходе — не оставляем orphan powershell
             try { if (!process.HasExited) process.Kill(true); } catch { }
             process.Dispose();
         }
@@ -530,47 +530,44 @@ public class ZapretConfigService
         return $"{httpEmoji} {http} | {tls12Emoji} {tls12} | {tls13Emoji} {tls13}";
     }
 
-    public static async Task<bool> ApplyConfigAsync(string zapretPath, string configName)
+    public static Task<bool> ApplyConfigAsync(string zapretPath, string configName)
+        => Task.Run(() => ApplyConfigCoreAsync(zapretPath, configName));
+
+    private static async Task<bool> ApplyConfigCoreAsync(string zapretPath, string configName)
     {
         try
         {
             var zapretDir = Path.GetDirectoryName(zapretPath);
             if (string.IsNullOrEmpty(zapretDir))
-            {
                 return false;
-            }
 
             var configPath = Path.Combine(zapretDir, configName);
             if (!File.Exists(configPath))
-            {
                 return false;
-            }
 
             var binPath = Path.Combine(zapretDir, "bin");
             var winwsExe = Path.Combine(binPath, "winws.exe");
             if (!File.Exists(winwsExe))
-            {
                 return false;
-            }
 
-            var args = await ParseConfigArgsAsync(configPath, zapretDir, binPath);
-            if (string.IsNullOrEmpty(args))
-            {
+            var argTokens = await ParseConfigArgTokensAsync(configPath, zapretDir, binPath).ConfigureAwait(false);
+            if (argTokens.Count == 0)
                 return false;
-            }
 
-            await StopAndRemoveServiceAsync("zapret");
+            await StopAndRemoveServiceAsync("zapret").ConfigureAwait(false);
+            await EnableTcpTimestampsAsync().ConfigureAwait(false);
 
-            EnableTcpTimestamps();
+            // сначала служба (как в service.bat), потом прямой winws, потом сам .bat
+            if (await InstallAndStartServiceAsync(winwsExe, argTokens, configName).ConfigureAwait(false))
+                return true;
 
-            var success = await CreateServiceAsync("zapret", winwsExe, args, configName);
+            if (await TryStartWinwsDirectAsync(winwsExe, argTokens, binPath).ConfigureAwait(false))
+                return true;
 
-            if (success)
-            {
-                await StartServiceAsync("zapret");
-            }
+            if (await TryStartViaStrategyBatAsync(configPath, zapretDir).ConfigureAwait(false))
+                return true;
 
-            return success;
+            return false;
         }
         catch
         {
@@ -578,92 +575,238 @@ public class ZapretConfigService
         }
     }
 
-    private static async Task<string> ParseConfigArgsAsync(string configPath, string zapretDir, string binPath)
+    public static Task<bool> IsZapretUpAsync()
     {
         try
         {
-            var lines = await File.ReadAllLinesAsync(configPath);
+            if (Process.GetProcessesByName("winws").Length > 0)
+                return Task.FromResult(true);
+            if (Process.GetProcessesByName("nfqws").Length > 0)
+                return Task.FromResult(true);
+        }
+        catch { }
 
+        return Task.FromResult(false);
+    }
+
+    // без .exe — иначе GetProcessesByName пустой
+    public static void KillWinwsProcesses()
+    {
+        foreach (var name in new[] { "winws", "nfqws" })
+        {
+            foreach (var proc in Process.GetProcessesByName(name))
+            {
+                try { proc.Kill(true); proc.Dispose(); } catch { }
+            }
+        }
+    }
+
+    public static void KillTgWsProcesses()
+    {
+        foreach (var name in new[] { "TgWsProxy", "tg-ws-proxy", "tgwsproxy" })
+        {
+            foreach (var proc in Process.GetProcessesByName(name))
+            {
+                try { proc.Kill(true); proc.Dispose(); } catch { }
+            }
+        }
+    }
+
+    private static async Task<bool> WaitForWinwsAsync(int attempts = 12, int delayMs = 300)
+    {
+        for (int i = 0; i < attempts; i++)
+        {
+            await Task.Delay(delayMs).ConfigureAwait(false);
+            if (await IsZapretUpAsync().ConfigureAwait(false))
+                return true;
+        }
+        return false;
+    }
+
+    private static async Task<bool> TryStartWinwsDirectAsync(string winwsExe, List<string> argTokens, string workingDir)
+    {
+        try
+        {
+            foreach (var proc in Process.GetProcessesByName("winws"))
+            {
+                try { proc.Kill(); proc.Dispose(); } catch { }
+            }
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = winwsExe,
+                WorkingDirectory = workingDir,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            foreach (var a in argTokens)
+                psi.ArgumentList.Add(a);
+
+            Process.Start(psi);
+            return await WaitForWinwsAsync().ConfigureAwait(false);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // запасной вариант — просто прогнать .bat, как вручную
+    private static async Task<bool> TryStartViaStrategyBatAsync(string configPath, string zapretDir)
+    {
+        try
+        {
+            KillWinwsProcesses();
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/c \"\"{configPath}\"\"",
+                WorkingDirectory = zapretDir,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            Process.Start(psi);
+            return await WaitForWinwsAsync(15, 350).ConfigureAwait(false);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static async Task<(bool Ok, string? UsedConfig)> TryStartBestConfigAsync(
+        string zapretPath,
+        ZapretConfigCache? cache = null,
+        Action<string>? log = null,
+        int maxAlts = 12)
+    {
+        cache ??= LoadCache() ?? new ZapretConfigCache();
+        var tried = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var zapretDir = Path.GetDirectoryName(zapretPath) ?? "";
+
+        async Task<bool> TryOne(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name) || !tried.Add(name))
+                return false;
+
+            var batPath = Path.Combine(zapretDir, name);
+            if (!File.Exists(batPath))
+                return false;
+
+            log?.Invoke(name);
+            if (!await ApplyConfigAsync(zapretPath, name).ConfigureAwait(false))
+                return false;
+
+            cache.CurrentConfig = name;
+            SaveCache(cache);
+            return true;
+        }
+
+        if (await TryOne(cache.CurrentConfig).ConfigureAwait(false))
+            return (true, cache.CurrentConfig);
+
+        // в кэше идеальные уже сверху по пингу
+        var candidates = cache.GetSelectableConfigs()
+            .Select(c => c.Name)
+            .Where(n => !string.Equals(n, cache.CurrentConfig, StringComparison.OrdinalIgnoreCase))
+            .Take(maxAlts)
+            .ToList();
+
+        foreach (var name in candidates)
+        {
+            if (await TryOne(name).ConfigureAwait(false))
+                return (true, name);
+        }
+
+        return (false, null);
+    }
+
+    // вытаскиваем аргументы winws из strategy.bat
+    private static async Task<List<string>> ParseConfigArgTokensAsync(string configPath, string zapretDir, string binPath)
+    {
+        try
+        {
+            var lines = await File.ReadAllLinesAsync(configPath).ConfigureAwait(false);
             var listsPath = Path.Combine(zapretDir, "lists");
-            var fullText = "";
+            var fullText = new StringBuilder();
             bool capture = false;
 
             foreach (var line in lines)
             {
                 var trimmed = line.Trim();
+                if (trimmed.Length == 0 || trimmed.StartsWith("::") || trimmed.StartsWith("rem ", StringComparison.OrdinalIgnoreCase))
+                    continue;
 
-                if (trimmed.Contains("winws.exe"))
+                if (trimmed.Contains("winws.exe", StringComparison.OrdinalIgnoreCase))
                 {
                     capture = true;
-                    var idx = trimmed.IndexOf("winws.exe");
+                    var idx = trimmed.IndexOf("winws.exe", StringComparison.OrdinalIgnoreCase);
                     if (idx >= 0)
-                    {
-                        trimmed = trimmed.Substring(idx + "winws.exe".Length).Trim();
-                    }
+                        trimmed = trimmed[(idx + "winws.exe".Length)..].Trim();
+                    // хвост от "%BIN%winws.exe"
+                    if (trimmed.StartsWith('"'))
+                        trimmed = trimmed[1..].Trim();
                 }
 
                 if (!capture) continue;
 
-                if (trimmed.EndsWith("^"))
-                {
-                    trimmed = trimmed.Substring(0, trimmed.Length - 1).Trim();
-                }
+                if (trimmed.EndsWith('^'))
+                    trimmed = trimmed[..^1].TrimEnd();
 
-                fullText += " " + trimmed;
+                if (trimmed.Length == 0) continue;
+                fullText.Append(' ').Append(trimmed);
             }
 
-            fullText = fullText.Replace("%BIN%", binPath + "\\");
-            fullText = fullText.Replace("%LISTS%", listsPath + "\\");
+            var text = fullText.ToString();
+            text = text.Replace("%BIN%", binPath + "\\", StringComparison.OrdinalIgnoreCase);
+            text = text.Replace("%LISTS%", listsPath + "\\", StringComparison.OrdinalIgnoreCase);
             var (gameTcp, gameUdp) = ZapretOptionsService.GetGameFilterPorts(zapretDir);
-            fullText = fullText.Replace("%GameFilter%", gameTcp);
-            fullText = fullText.Replace("%GameFilterTCP%", gameTcp);
-            fullText = fullText.Replace("%GameFilterUDP%", gameUdp);
+            text = text.Replace("%GameFilter%", gameTcp, StringComparison.OrdinalIgnoreCase);
+            text = text.Replace("%GameFilterTCP%", gameTcp, StringComparison.OrdinalIgnoreCase);
+            text = text.Replace("%GameFilterUDP%", gameUdp, StringComparison.OrdinalIgnoreCase);
 
-            fullText = fullText.Replace("\"", "");
-
-            fullText = System.Text.RegularExpressions.Regex.Replace(fullText, @"\s+", " ").Trim();
-
-            return fullText;
+            return SplitArgs(text)
+                .Select(t => t.Trim().Trim('"'))
+                .Where(t => t.Length > 0 && t != "^")
+                .ToList();
         }
         catch
         {
-            return "";
+            return [];
         }
     }
 
     private static List<string> SplitArgs(string line)
     {
         var result = new List<string>();
-        var current = "";
+        var current = new StringBuilder();
         bool inQuotes = false;
 
-        for (int i = 0; i < line.Length; i++)
+        foreach (char c in line)
         {
-            char c = line[i];
-
             if (c == '"')
             {
                 inQuotes = !inQuotes;
-                current += c;
+                continue;
             }
-            else if (c == ' ' && !inQuotes)
+
+            if (c == ' ' && !inQuotes)
             {
-                if (!string.IsNullOrWhiteSpace(current))
+                if (current.Length > 0)
                 {
-                    result.Add(current);
-                    current = "";
+                    result.Add(current.ToString());
+                    current.Clear();
                 }
             }
             else
             {
-                current += c;
+                current.Append(c);
             }
         }
 
-        if (!string.IsNullOrWhiteSpace(current))
-        {
-            result.Add(current);
-        }
+        if (current.Length > 0)
+            result.Add(current.ToString());
 
         return result;
     }
@@ -672,139 +815,61 @@ public class ZapretConfigService
     {
         try
         {
-            var stopPsi = new ProcessStartInfo
-            {
-                FileName = "net",
-                Arguments = $"stop {serviceName}",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
+            KillWinwsProcesses();
 
-            using (var stopProc = Process.Start(stopPsi))
-            {
-                if (stopProc != null)
-                {
-                    await stopProc.WaitForExitAsync();
-                }
-            }
-
-            await Task.Delay(500);
-
-            var deletePsi = new ProcessStartInfo
-            {
-                FileName = "sc",
-                Arguments = $"delete {serviceName}",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-
-            using (var deleteProc = Process.Start(deletePsi))
-            {
-                if (deleteProc != null)
-                {
-                    await deleteProc.WaitForExitAsync();
-                }
-            }
-
-            await Task.Delay(500);
-
-            foreach (var proc in Process.GetProcessesByName("winws"))
-            {
-                try { proc.Kill(); proc.Dispose(); } catch { }
-            }
+            await ProcessRunner.RunAsync("sc", $"stop {serviceName}", 8000).ConfigureAwait(false);
+            await Task.Delay(300).ConfigureAwait(false);
+            await ProcessRunner.RunAsync("sc", $"delete {serviceName}", 8000).ConfigureAwait(false);
+            await Task.Delay(400).ConfigureAwait(false);
         }
         catch { }
     }
 
-    private static void EnableTcpTimestamps()
+    private static async Task EnableTcpTimestampsAsync()
     {
         try
         {
-            var psi = new ProcessStartInfo
-            {
-                FileName = "netsh",
-                Arguments = "interface tcp set global timestamps=enabled",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-
-            using var proc = Process.Start(psi);
-            proc?.WaitForExit();
+            await ProcessRunner.RunAsync("netsh", "interface tcp set global timestamps=enabled", 5000)
+                .ConfigureAwait(false);
         }
         catch { }
     }
 
-    private static async Task<bool> CreateServiceAsync(string serviceName, string exePath, string args, string configName)
+    // sc create + ImagePath в реестре (кавычки в binPath= у sc легко ломаются)
+    private static async Task<bool> InstallAndStartServiceAsync(string exePath, List<string> argTokens, string configName)
     {
         try
         {
-            var binPathValue = $"\"{exePath}\" {args}";
+            await ProcessRunner.RunAsync(
+                "sc",
+                $"create zapret binPath= \"{exePath}\" DisplayName= \"zapret\" start= auto",
+                8000).ConfigureAwait(false);
 
-            var createPsi = new ProcessStartInfo
+            var imagePath = BuildImagePath(exePath, argTokens);
+            try
             {
-                FileName = "sc",
-                Arguments = $"create {serviceName} binPath= \"{binPathValue}\" DisplayName= \"zapret\" start= auto",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-
-            using (var createProc = Process.Start(createPsi))
+                Registry.SetValue(
+                    @"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\zapret",
+                    "ImagePath",
+                    imagePath,
+                    RegistryValueKind.ExpandString);
+            }
+            catch
             {
-                if (createProc != null)
-                {
-                    var output = await createProc.StandardOutput.ReadToEndAsync();
-                    var error = await createProc.StandardError.ReadToEndAsync();
-                    await createProc.WaitForExitAsync();
-
-                    if (createProc.ExitCode != 0) return false;
-                }
+                return false;
             }
 
-            var descPsi = new ProcessStartInfo
-            {
-                FileName = "sc",
-                Arguments = $"description {serviceName} \"Zapret DPI bypass software\"",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
+            await ProcessRunner.RunAsync("sc", "description zapret \"Zapret DPI bypass software\"", 5000)
+                .ConfigureAwait(false);
 
-            using (var descProc = Process.Start(descPsi))
-            {
-                if (descProc != null)
-                {
-                    await descProc.WaitForExitAsync();
-                }
-            }
+            var strategyName = Path.GetFileNameWithoutExtension(configName);
+            await ProcessRunner.RunAsync(
+                "reg",
+                $"add \"HKLM\\System\\CurrentControlSet\\Services\\zapret\" /v zapret-discord-youtube /t REG_SZ /d \"{strategyName}\" /f",
+                5000).ConfigureAwait(false);
 
-            var regPsi = new ProcessStartInfo
-            {
-                FileName = "reg",
-                Arguments = $"add \"HKLM\\System\\CurrentControlSet\\Services\\{serviceName}\" /v zapret-discord-youtube /t REG_SZ /d \"{configName.Replace(".bat", "")}\" /f",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-
-            using (var regProc = Process.Start(regPsi))
-            {
-                if (regProc != null)
-                {
-                    await regProc.WaitForExitAsync();
-                }
-            }
-
-            return true;
+            await StartServiceAsync("zapret").ConfigureAwait(false);
+            return await WaitForWinwsAsync().ConfigureAwait(false);
         }
         catch
         {
@@ -812,27 +877,29 @@ public class ZapretConfigService
         }
     }
 
+    private static string BuildImagePath(string exePath, List<string> argTokens)
+    {
+        var sb = new StringBuilder();
+        sb.Append('"').Append(exePath).Append('"');
+        foreach (var a in argTokens)
+        {
+            sb.Append(' ');
+            if (a.Contains(' ') || a.Contains('\t'))
+                sb.Append('"').Append(a).Append('"');
+            else
+                sb.Append(a);
+        }
+        return sb.ToString();
+    }
+
     private static async Task StartServiceAsync(string serviceName)
     {
         try
         {
-            var startPsi = new ProcessStartInfo
-            {
-                FileName = "sc",
-                Arguments = $"start {serviceName}",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-
-            using var startProc = Process.Start(startPsi);
-            if (startProc != null)
-            {
-                var output = await startProc.StandardOutput.ReadToEndAsync();
-                var error = await startProc.StandardError.ReadToEndAsync();
-                await startProc.WaitForExitAsync();
-            }
+            var (code, _) = await ProcessRunner.RunAsync("sc", $"start {serviceName}", 15000)
+                .ConfigureAwait(false);
+            if (code != 0 && code != 1056)
+                await ProcessRunner.RunAsync("net", $"start {serviceName}", 15000).ConfigureAwait(false);
         }
         catch { }
     }

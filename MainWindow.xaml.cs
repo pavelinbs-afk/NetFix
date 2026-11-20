@@ -140,9 +140,14 @@ public partial class MainWindow : Window
     private bool _autoFixRunning = false;
     private int _zapretToggleFails = 0;
     private int _mainZapretStartFails = 0;
+    private DateTime _fixServiceCooldownUntil = DateTime.MinValue;
+    private bool _fixServiceRunning = false;
+    private bool _zapretWasRunningBeforeConfig;
     private Views.ZapretConfigWindow? _configWindow = null;
 
     private bool _isConnected;
+    // пауза, чтобы после стопа не мигало «Подключено»
+    private DateTime _suppressConnectedUntil = DateTime.MinValue;
     private DateTime _connectedSince;
     private DispatcherTimer? _connectedTimer;
     private bool _isInstalling = false;
@@ -388,6 +393,8 @@ public partial class MainWindow : Window
     {
         if (_settings.DiscordRpcEnabled)
             _discord.Initialize();
+        else
+            _discord.Disable();
         UpdateMainGridClip();
         LoadSettingsToPanel();
         UpdateSelectedConfigDisplay();
@@ -779,55 +786,40 @@ public partial class MainWindow : Window
 
             if (st.ZapretRunning)
             {
-                foreach (var p in Process.GetProcessesByName("winws"))
-                    try { p.Kill(); } catch { }
-                foreach (var p in Process.GetProcessesByName("winws.exe"))
-                    try { p.Kill(); } catch { }
+                ZapretConfigService.KillWinwsProcesses();
+                await AntiCheatBypassService.RunCommandAsync("sc", "stop zapret", 8000);
                 _zapretToggleFails = 0;
             }
             else
             {
                 if (!string.IsNullOrEmpty(_settings.ZapretPath) && File.Exists(_settings.ZapretPath))
                 {
-                    var isServiceBat = System.IO.Path.GetFileName(_settings.ZapretPath).Equals("service.bat", StringComparison.OrdinalIgnoreCase);
                     var cache = ZapretConfigService.LoadCache();
 
-                    if (isServiceBat)
+                    if (cache == null || !cache.HasAnyConfigs || string.IsNullOrEmpty(cache.CurrentConfig))
                     {
-                        if (cache == null || !cache.HasAnyConfigs)
-                        {
-                            ShowFullScanRequiredNotification(
-                                "Конфиги Zapret не найдены",
-                                "Приложение не смогло обнаружить рабочие конфиги для Zapret.\n\n" +
-                                "Сначала пройдите полное сканирование, чтобы NetFix нашёл доступные конфиги и подготовил запуск сервиса.");
-                            _zapretToggleFails = 0;
-                            return;
-                        }
-
-                        if (string.IsNullOrEmpty(cache.CurrentConfig))
-                        {
-                            _zapretToggleFails = 0;
-                            return;
-                        }
-
-                        ZapretToggleBtn.IsEnabled = false;
-                        var originalContent = ZapretToggleBtn.Content;
-                        ZapretToggleBtn.Content = "Запуск...";
-
-                        bool success = await ZapretConfigService.ApplyConfigAsync(_settings.ZapretPath, cache.CurrentConfig);
-
-                        ZapretToggleBtn.IsEnabled = true;
-                        ZapretToggleBtn.Content = originalContent;
-
-                        if (!success)
-                        {
-                            TrackZapretStartFail();
-                            return;
-                        }
+                        ShowFullScanRequiredNotification(
+                            "Конфиги Zapret не найдены",
+                            "Приложение не смогло обнаружить рабочие конфиги для Zapret.\n\n" +
+                            "Сначала пройдите полное сканирование, чтобы NetFix нашёл доступные конфиги и подготовил запуск сервиса.");
+                        _zapretToggleFails = 0;
+                        return;
                     }
-                    else
+
+                    ZapretToggleBtn.IsEnabled = false;
+                    var originalContent = ZapretToggleBtn.Content;
+                    ZapretToggleBtn.Content = "Запуск...";
+
+                    // service.bat сам по себе winws не поднимает
+                    bool success = await ZapretConfigService.ApplyConfigAsync(_settings.ZapretPath, cache.CurrentConfig);
+
+                    ZapretToggleBtn.IsEnabled = true;
+                    ZapretToggleBtn.Content = originalContent;
+
+                    if (!success)
                     {
-                        Process.Start(new ProcessStartInfo(_settings.ZapretPath) { UseShellExecute = true });
+                        TrackZapretStartFail();
+                        return;
                     }
                 }
                 else
@@ -860,15 +852,13 @@ public partial class MainWindow : Window
             var st = DiagnosticsEngine.CheckAppStatus();
             if (st.TgWsProxyRunning)
             {
-                foreach (var p in Process.GetProcessesByName("TgWsProxy"))
-                    try { p.Kill(); } catch { }
+                ZapretConfigService.KillTgWsProcesses();
             }
             else
             {
                 if (!string.IsNullOrEmpty(_settings.TgWsProxyPath) && File.Exists(_settings.TgWsProxyPath))
                 {
                     Process.Start(new ProcessStartInfo(_settings.TgWsProxyPath) { UseShellExecute = true });
-
                     await ActivateTgWsProxyAsync();
                 }
                 else
@@ -877,7 +867,7 @@ public partial class MainWindow : Window
                 }
             }
 
-            await Task.Delay(2000);
+            await Task.Delay(1500);
             UpdateActiveApps();
         }
         finally
@@ -902,15 +892,75 @@ public partial class MainWindow : Window
         if (string.IsNullOrEmpty(_settings.ZapretPath) || !File.Exists(_settings.ZapretPath))
             return;
 
+        _zapretWasRunningBeforeConfig = DiagnosticsEngine.CheckAppStatus().ZapretRunning;
         var w = new Views.ZapretConfigWindow(_settings.ZapretPath, testMode);
         _configWindow = w;
         w.Owner = this;
-        w.Closed += (_, _) =>
+        w.Closed += async (_, _) =>
         {
             _configWindow = null;
+            _suppressConnectedUntil = DateTime.UtcNow.AddSeconds(6);
+
+            try { await RestoreZapretAfterConfigWindowAsync(w); }
+            catch { }
+
             onClosed?.Invoke(w);
         };
         w.Show();
+    }
+
+    // тест мог прибить winws — поднимаем обратно, если надо
+    private async Task RestoreZapretAfterConfigWindowAsync(Views.ZapretConfigWindow w)
+    {
+        bool needUp = w.ConfigWasApplied || _zapretWasRunningBeforeConfig;
+        if (!needUp || string.IsNullOrEmpty(_settings.ZapretPath))
+        {
+            UpdateActiveApps();
+            return;
+        }
+
+        await Task.Delay(400);
+
+        var st = DiagnosticsEngine.CheckAppStatus();
+        if (st.ZapretRunning)
+        {
+            _suppressConnectedUntil = DateTime.MinValue;
+            _zapretToggleFails = 0;
+            _mainZapretStartFails = 0;
+            if (_settings.EnableZapret)
+                PlayConnectedUi("Готово");
+            UpdateActiveApps();
+            return;
+        }
+
+        var cache = ZapretConfigService.LoadCache();
+        if (cache is null || string.IsNullOrEmpty(cache.CurrentConfig))
+        {
+            UpdateActiveApps();
+            return;
+        }
+
+        AppendLog("Поднимаю Zapret обратно…", "info");
+        bool ok = await ZapretConfigService.ApplyConfigAsync(_settings.ZapretPath, cache.CurrentConfig);
+        await Task.Delay(500);
+        st = DiagnosticsEngine.CheckAppStatus();
+
+        if (ok && st.ZapretRunning)
+        {
+            _suppressConnectedUntil = DateTime.MinValue;
+            _zapretToggleFails = 0;
+            _mainZapretStartFails = 0;
+            AppendLog("Zapret снова работает", "ok");
+            if (_settings.EnableZapret)
+                PlayConnectedUi("Готово");
+        }
+        else
+        {
+            AppendLog("Zapret после окна конфигов не поднялся", "warn");
+            PlayDisconnectedUi();
+        }
+
+        UpdateActiveApps();
     }
 
     private void TestConfigsBtn_Click(object s, RoutedEventArgs e)
@@ -941,24 +991,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        ShowConfigWindow(testMode: false, onClosed: async (w) =>
-        {
-            UpdateSelectedConfigDisplay();
-
-            if (w.ConfigWasApplied)
-            {
-                var status = DiagnosticsEngine.CheckAppStatus();
-                if (!status.ZapretRunning)
-                {
-                    ZapretToggle_Click(this, new RoutedEventArgs());
-                }
-                else
-                {
-
-                }
-            }
-
-        });
+        ShowConfigWindow(testMode: false, onClosed: _ => UpdateSelectedConfigDisplay());
     }
 
     private void ModsBtn_Click(object s, RoutedEventArgs e)
@@ -1657,7 +1690,7 @@ public partial class MainWindow : Window
                 _ = AutoHostsModService.DownloadAutoModsFilesAsync(activeAutoMods).ContinueWith(t =>
                     Dispatcher.Invoke(() =>
                     {
-                        // без свежих авто-списков в hosts лучше ничего не писать
+                        // список не скачался — hosts не трогаем
                         if (t.IsFaulted || !t.Result)
                         {
                             ShowModsError("Не удалось загрузить авто-списки. Hosts не применены.");
@@ -2752,15 +2785,48 @@ public partial class MainWindow : Window
 
     private async void FixServiceBtn_Click(object s, RoutedEventArgs e)
     {
-        var serviceBat = @"C:\Zapret\service.bat";
-        if (!File.Exists(serviceBat))
+        if (_fixServiceRunning) return;
+        if (DateTime.UtcNow < _fixServiceCooldownUntil)
         {
-            AppendLog("service.bat не найден в C:\\Zapret", "error");
+            AppendLog("Исправить уже недавно запускался — подожди немного", "info");
             return;
         }
 
+        _fixServiceRunning = true;
+        _fixServiceCooldownUntil = DateTime.UtcNow.AddSeconds(45);
+
         try
         {
+            AppendLog("Пробую поднять Zapret…", "info");
+
+            // только старт — toggle тут гасил только что поднятый winws
+            if (!string.IsNullOrEmpty(_settings.ZapretPath) && File.Exists(_settings.ZapretPath))
+            {
+                var cache = ZapretConfigService.LoadCache() ?? new ZapretConfigCache();
+                bool ok = await TryStartZapretSmartAsync(cache);
+                await Task.Delay(500);
+                UpdateActiveApps();
+
+                if (ok && DiagnosticsEngine.CheckAppStatus().ZapretRunning)
+                {
+                    _zapretToggleFails = 0;
+                    _mainZapretStartFails = 0;
+                    AppendLog("Zapret поднялся", "ok");
+                }
+                else
+                {
+                    AppendLog("Не вышло поднять Zapret", "warn");
+                }
+                return;
+            }
+
+            var serviceBat = @"C:\Zapret\service.bat";
+            if (!File.Exists(serviceBat))
+            {
+                AppendLog("service.bat не найден в C:\\Zapret", "error");
+                return;
+            }
+
             var proc = Process.Start(new ProcessStartInfo("cmd.exe", $"/c \"{serviceBat}\" admin")
             {
                 UseShellExecute = false,
@@ -2773,18 +2839,24 @@ public partial class MainWindow : Window
             if (proc is { HasExited: false })
                 await proc.StandardInput.WriteLineAsync("0");
 
-            await Task.Delay(500);
-
-            ZapretToggleBtn.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            await Task.Delay(800);
+            UpdateActiveApps();
         }
         catch (Exception ex)
         {
             AppendLog($"Ошибка: {ex.Message}", "error");
         }
+        finally
+        {
+            _fixServiceRunning = false;
+        }
     }
 
     private void TrackZapretStartFail()
     {
+        if (_fixServiceRunning || DateTime.UtcNow < _fixServiceCooldownUntil)
+            return;
+
         _zapretToggleFails++;
         if (_zapretToggleFails >= 2)
         {
@@ -2796,6 +2868,9 @@ public partial class MainWindow : Window
 
     private void TrackMainZapretStartFail()
     {
+        if (_fixServiceRunning || DateTime.UtcNow < _fixServiceCooldownUntil)
+            return;
+
         _mainZapretStartFails++;
         if (_mainZapretStartFails >= 2)
         {
@@ -5464,7 +5539,7 @@ public partial class MainWindow : Window
         Task.Run(async () =>
         {
             var st = DiagnosticsEngine.CheckAppStatus();
-            bool vpn = DetectVpn(out string _);
+            bool vpn = DiagnosticsEngine.DetectVpn(out string _);
             bool netOk = await DiagnosticsEngine.CheckInternetAsync();
             if (_settings.ForceNetworkOk) netOk = true;
 
@@ -5533,13 +5608,17 @@ public partial class MainWindow : Window
                     (!_settings.EnableZapret || st.ZapretRunning) &&
                     (!_settings.EnableTgWsProxy || st.TgWsProxyRunning);
                 bool anyEnabled = _settings.EnableZapret || _settings.EnableTgWsProxy;
+                bool suppressConnected = DateTime.UtcNow < _suppressConnectedUntil;
+                bool configUiOpen = _configWindow is not null;
 
                 if (!allEnabledRunning && _isConnected
-                    && !_isInstalling && !_autoFixRunning && !_checkInProgress)
+                    && !_isInstalling && !_autoFixRunning && !_checkInProgress
+                    && !configUiOpen && !suppressConnected)
                     SetFixBtnDisconnected();
 
                 if (allEnabledRunning && anyEnabled && !_isConnected
-                    && !_isInstalling && !_autoFixRunning && !_checkInProgress)
+                    && !_isInstalling && !_autoFixRunning && !_checkInProgress
+                    && !suppressConnected && !configUiOpen)
                     SetConnectedFromStatus();
             });
         });
@@ -5580,37 +5659,7 @@ public partial class MainWindow : Window
     }
 
     private static bool DetectVpn(out string info)
-    {
-        info = "";
-        try
-        {
-            foreach (var v in new[] { "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY" })
-            {
-                var val = Environment.GetEnvironmentVariable(v);
-                if (!string.IsNullOrEmpty(val)) { info = $"proxy env: {val}"; return true; }
-            }
-            var result = RunProcess("ipconfig", "");
-            string[] vpnKw = ["tap-windows", "wireguard", "wintun", "nordvpn", "expressvpn",
-                               "openvpn", "outline", "warp", "mullvad", "proton", "tun"];
-            foreach (var kw in vpnKw)
-                if (result.ToLower().Contains(kw)) { info = kw; return true; }
-        }
-        catch { }
-        return false;
-    }
-
-    private static string RunProcess(string name, string args)
-    {
-        try
-        {
-            var p = Process.Start(new ProcessStartInfo(name, args)
-            { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true })!;
-            string o = p.StandardOutput.ReadToEnd();
-            p.WaitForExit(3000);
-            return o;
-        }
-        catch { return ""; }
-    }
+        => DiagnosticsEngine.DetectVpn(out info);
 
     private async Task WriteStartupLogAsync()
     {
@@ -5650,14 +5699,27 @@ public partial class MainWindow : Window
         await Task.Delay(d);
         AppendLog("spacer");
 
-        if (status.ZapretRunning && status.TgWsProxyRunning && admin)
+        bool zapretWanted = _settings.EnableZapret;
+        bool tgWanted = _settings.EnableTgWsProxy;
+        bool allWantedUp =
+            (!zapretWanted || status.ZapretRunning) &&
+            (!tgWanted || status.TgWsProxyRunning) &&
+            (zapretWanted || tgWanted);
+
+        if (allWantedUp && admin)
         {
             await Task.Delay(d);
             AppendLog("Всё запущено и всё работает НОРМАЛЬНО!", "final");
-            await Task.Delay(d);
-            AppendLog("Zapret включен. Discord и YouTube должны работать нормально.", "ok");
-            await Task.Delay(d);
-            AppendLog("Прокси настроен. Telegram должен работать стабильно.", "ok");
+            if (zapretWanted && status.ZapretRunning)
+            {
+                await Task.Delay(d);
+                AppendLog("Zapret включен. Discord и YouTube должны работать нормально.", "ok");
+            }
+            if (tgWanted && status.TgWsProxyRunning)
+            {
+                await Task.Delay(d);
+                AppendLog("Прокси настроен. Telegram должен работать стабильно.", "ok");
+            }
         }
         else
         {
@@ -6035,44 +6097,93 @@ public partial class MainWindow : Window
     {
         if (_checkInProgress || _autoFixRunning || _isInstalling) return;
 
-        ShowPlayWhileScanDialog();
-
         if (!_settings.EnableZapret && !_settings.EnableTgWsProxy)
         {
             AppendLog("Оба компонента отключены в настройках. Включите хотя бы один.", "warn");
             return;
         }
 
-        FixBtn.IsEnabled = false;
-        _checkInProgress = true;
-        StartLongCheckTimer();
+        // если уже работает — просто выключаем
+        var runningNow = DiagnosticsEngine.CheckAppStatus();
+        bool allUp = (_settings.EnableZapret || _settings.EnableTgWsProxy)
+            && (!_settings.EnableZapret || runningNow.ZapretRunning)
+            && (!_settings.EnableTgWsProxy || runningNow.TgWsProxyRunning);
+        if (_isConnected || allUp)
+        {
+            await StopBypassFromFixBtnAsync();
+            return;
+        }
 
         if (_settings.Mode == FixMode.Fast)
         {
+            FixBtn.IsEnabled = false;
+            _checkInProgress = true;
             RunFastFix();
             return;
         }
 
-        var (needsUpdate, reason) = await ComponentVersionService.CheckIfUpdateNeededAsync(_settings);
+        var st = DiagnosticsEngine.CheckAppStatus();
+        var cache = ZapretConfigService.LoadCache();
+        // конфиг уже выбран — поднимаем сразу, без мастера и без «долгой проверки»
+        bool canQuickStartZapret = _settings.EnableZapret
+            && !st.ZapretRunning
+            && !string.IsNullOrWhiteSpace(_settings.ZapretPath)
+            && File.Exists(_settings.ZapretPath)
+            && cache != null
+            && !string.IsNullOrEmpty(cache.CurrentConfig);
 
-        if (needsUpdate)
+        if (canQuickStartZapret)
         {
-            StopLongCheckTimer();
-            _checkInProgress = false;
-            await RunAutoInstallAsync();
+            FixBtn.IsEnabled = false;
+            _checkInProgress = true;
+            EnterWorkingState("Запуск Zapret...");
+            LogBox.Document.Blocks.Clear();
+
+            bool applied = await TryStartZapretSmartAsync(cache!);
+            if (applied)
+            {
+                await FinishAfterZapretAppliedAsync();
+                return;
+            }
+
+            // сохранённый/альты не взяли — диагностика + TgWs для Telegram
+            AppendLog("Готовые конфиги не поднялись. Запускаю диагностику…", "warn");
+            if (_settings.EnableTgWsProxy
+                && !string.IsNullOrWhiteSpace(_settings.TgWsProxyPath)
+                && File.Exists(_settings.TgWsProxyPath)
+                && !DiagnosticsEngine.CheckAppStatus().TgWsProxyRunning)
+            {
+                AppendLog("Параллельно поднимаю TgWsProxy для Telegram…", "info");
+                StartTgWsProxyWithActivation();
+            }
+
+            ShowPlayWhileScanDialog();
+            StartLongCheckTimer();
+            RunAutoFix();
             return;
         }
-
-        var st = DiagnosticsEngine.CheckAppStatus();
 
         if (_settings.EnableZapret
             && !st.ZapretRunning
             && !string.IsNullOrWhiteSpace(_settings.ZapretPath)
             && File.Exists(_settings.ZapretPath))
         {
-            StopLongCheckTimer();
-            _checkInProgress = false;
+            ClearFixBusyState();
             ShowZapretWizard();
+            return;
+        }
+
+        ShowPlayWhileScanDialog();
+        FixBtn.IsEnabled = false;
+        _checkInProgress = true;
+        StartLongCheckTimer();
+
+        var (needsUpdate, reason) = await ComponentVersionService.CheckIfUpdateNeededAsync(_settings);
+
+        if (needsUpdate)
+        {
+            ClearFixBusyState();
+            await RunAutoInstallAsync();
             return;
         }
 
@@ -6087,10 +6198,109 @@ public partial class MainWindow : Window
         RunAutoFix();
     }
 
+    private async Task StopBypassFromFixBtnAsync()
+    {
+        FixBtn.IsEnabled = false;
+        _checkInProgress = true;
+        EnterWorkingState("Отключение...", "Отключение", "…");
+        LogBox.Document.Blocks.Clear();
+
+        AppendLog("ОСТАНОВКА ОБХОДА", "system");
+        AppendLog("spacer");
+
+        // чуть покрутим анимацию, даже если stop быстрый
+        var stopTask = StopAllBypassServicesAsync();
+        await Task.WhenAll(stopTask, Task.Delay(700));
+
+        AppendLog("Обход остановлен. Нажмите кнопку ещё раз, чтобы включить снова.", "ok");
+        _suppressConnectedUntil = DateTime.UtcNow.AddSeconds(4);
+        PlayDisconnectedUi();
+        if (!_isInGame)
+            _discord.SetProblems("Обход выключен");
+
+        ClearFixBusyState();
+        UpdateActiveApps();
+    }
+
+    private void ClearFixBusyState()
+    {
+        _checkInProgress = false;
+        StopLongCheckTimer();
+        FixBtn.IsEnabled = true;
+    }
+
+    private async Task<bool> TryStartZapretSmartAsync(ZapretConfigCache cache)
+    {
+        AppendLog("Поднимаю Zapret…", "info");
+        var (ok, used) = await ZapretConfigService.TryStartBestConfigAsync(
+            _settings.ZapretPath,
+            cache,
+            name => AppendLog($"Пробую «{name}»…", "info"));
+
+        if (ok)
+            AppendLog($"Zapret поднялся{(string.IsNullOrEmpty(used) ? "" : $" на «{used}»")}", "ok");
+        else
+            AppendLog("Не удалось поднять Zapret ни на одном конфиге", "warn");
+
+        return ok;
+    }
+
+    private async Task FinishAfterZapretAppliedAsync()
+    {
+        EnterWorkingState("Проверка…");
+        AppendLog("Конфиг Zapret применён", "ok");
+
+        bool wantZapret = _settings.EnableZapret;
+        bool wantTg = _settings.EnableTgWsProxy
+            && !string.IsNullOrWhiteSpace(_settings.TgWsProxyPath)
+            && File.Exists(_settings.TgWsProxyPath);
+
+        if (wantTg && !DiagnosticsEngine.CheckAppStatus().TgWsProxyRunning)
+        {
+            AppendLog("Запускаю TgWsProxy…", "info");
+            StartTgWsProxyWithActivation();
+        }
+
+        // winws иногда появляется не сразу
+        var after = new AppStatus();
+        bool zapretOk = !wantZapret;
+        bool tgOk = !wantTg;
+        for (int i = 0; i < 12; i++)
+        {
+            await Task.Delay(350);
+            after = DiagnosticsEngine.CheckAppStatus();
+            zapretOk = !wantZapret || after.ZapretRunning;
+            tgOk = !wantTg || after.TgWsProxyRunning;
+            if (zapretOk && tgOk) break;
+        }
+
+        UpdateActiveApps();
+
+        if (zapretOk && tgOk)
+        {
+            _suppressConnectedUntil = DateTime.MinValue;
+            AppendLog("Всё запущено и работает.", "final");
+            PlayConnectedUi("Готово");
+            if (!_isInGame)
+                _discord.SetAllGood(after.ZapretRunning, after.TgWsProxyRunning);
+        }
+        else
+        {
+            if (!zapretOk) AppendLog("Zapret не запустился. Загляни в панель сервисов.", "warn");
+            if (!tgOk) AppendLog("TgWsProxy не запустился. Загляни в панель сервисов.", "warn");
+            StopGlow(false);
+            PlayErrorRing();
+            PlayDisconnectedUi();
+        }
+
+        ClearFixBusyState();
+    }
+
     private async void RunAutoFix()
     {
         if (_autoFixRunning)
         {
+            ClearFixBusyState();
             return;
         }
 
@@ -6151,53 +6361,60 @@ public partial class MainWindow : Window
                 SetupProgLbl.Text = $"Настройка: {(int)(ratio * 100)}%";
             }),
             doneCb: (success, _) => Dispatcher.Invoke(async () => {
-                StopGlow(success);
-
                 _discord.IsScanning = false;
-
-                if (success)
-                {
-                    SetFixBtnConnected();
-                    _discord.SetAllGood(true, true);
-                }
-                else _discord.SetProblems("Ошибка автонастройки");
-
-                FixBtn.IsEnabled = true;
-
-                StopLongCheckTimer();
-                _checkInProgress = false;
-
                 _autoFixRunning = false;
+                ClearFixBusyState();
 
-                if (success) {
-                    AnimateProgressBar(100, Color.FromRgb(34, 197, 94), "Готово", 0.5);
+                // подождём чуть-чуть — процесс иногда поднимается с задержкой
+                AppStatus appStatus = DiagnosticsEngine.CheckAppStatus();
+                for (int i = 0; i < 6 && success; i++)
+                {
+                    bool zOk = !_settings.EnableZapret || appStatus.ZapretRunning
+                        || string.IsNullOrWhiteSpace(_settings.ZapretPath)
+                        || !File.Exists(_settings.ZapretPath);
+                    bool tOk = !_settings.EnableTgWsProxy || appStatus.TgWsProxyRunning
+                        || string.IsNullOrWhiteSpace(_settings.TgWsProxyPath)
+                        || !File.Exists(_settings.TgWsProxyPath);
+                    if (zOk && tOk) break;
+                    await Task.Delay(300);
+                    appStatus = DiagnosticsEngine.CheckAppStatus();
+                }
+
+                bool zapretPathOk = !string.IsNullOrWhiteSpace(_settings.ZapretPath) && File.Exists(_settings.ZapretPath);
+                bool tgPathOk = !string.IsNullOrWhiteSpace(_settings.TgWsProxyPath) && File.Exists(_settings.TgWsProxyPath);
+                bool zapretReally = !_settings.EnableZapret || !zapretPathOk || appStatus.ZapretRunning;
+                bool tgReally = !_settings.EnableTgWsProxy || !tgPathOk || appStatus.TgWsProxyRunning;
+                bool reallyOk = success && zapretReally && tgReally;
+
+                if (reallyOk)
+                {
+                    _suppressConnectedUntil = DateTime.MinValue;
                     AppendLog("spacer");
                     AppendLog("Всё запущено и всё работает НОРМАЛЬНО!", "final");
-                    AppendLog("Zapret включен. Discord и YouTube должны работать нормально.", "ok");
-                    AppendLog("Прокси настроен. Telegram должен работать стабильно.", "ok");
+                    if (_settings.EnableZapret && zapretPathOk && appStatus.ZapretRunning)
+                        AppendLog("Zapret включен. Discord и YouTube должны работать нормально.", "ok");
+                    if (_settings.EnableTgWsProxy && tgPathOk && appStatus.TgWsProxyRunning)
+                        AppendLog("Прокси настроен. Telegram должен работать стабильно.", "ok");
                     AppendLog("Если что-то всё еще не грузит, перейдите во вкладку «Частые вопросы».", "info");
-                    PlaySuccessRing();
-                } else {
-                    AnimateProgressBar(100, Color.FromRgb(239, 68, 68), "Ошибка", 0.5);
-                    AppendLog("Произошла ошибка при автоматической настройке. Проверьте пути в настройках.", "error");
-                    PlayErrorRing();
+                    PlayConnectedUi("Готово");
+                    _discord.SetAllGood(appStatus.ZapretRunning, appStatus.TgWsProxyRunning);
+                    _mainZapretStartFails = 0;
                 }
-
-                await Task.Delay(2500);
-
-                var appStatus = DiagnosticsEngine.CheckAppStatus();
-                _discord.SetAllGood(appStatus.ZapretRunning, appStatus.TgWsProxyRunning);
-
-                if (_settings.EnableZapret)
+                else
                 {
-                    if (!appStatus.ZapretRunning)
-                    {
+                    _discord.SetProblems("Ошибка автонастройки");
+                    StopGlow(false);
+                    AnimateProgressBar(100, Color.FromRgb(239, 68, 68), "Ошибка", 0.5);
+                    if (!zapretReally)
+                        AppendLog("Zapret так и не запустился.", "warn");
+                    if (!tgReally)
+                        AppendLog("TgWsProxy так и не запустился.", "warn");
+                    AppendLog("Автонастройка не подняла все сервисы. Проверьте пути и конфиг.", "error");
+                    PlayErrorRing();
+                    PlayDisconnectedUi();
+
+                    if (_settings.EnableZapret && zapretPathOk && !appStatus.ZapretRunning)
                         TrackMainZapretStartFail();
-                    }
-                    else
-                    {
-                        _mainZapretStartFails = 0;
-                    }
                 }
             }),
             settings: _settings);
@@ -6205,7 +6422,11 @@ public partial class MainWindow : Window
 
     private async void RunFastFix()
     {
-        if (_autoFixRunning) return;
+        if (_autoFixRunning)
+        {
+            ClearFixBusyState();
+            return;
+        }
         _autoFixRunning = true;
 
         EnterWorkingState("Быстрый запуск...");
@@ -6258,23 +6479,28 @@ public partial class MainWindow : Window
 
         if (!zapretNeeded && !tgwsNeeded)
         {
-            if (_settings.EnableZapret) AppendLog("Zapret уже запущен", "ok");
-            if (_settings.EnableTgWsProxy) AppendLog("tg-ws-proxy уже запущен", "ok");
+            // перепроверяем — мало ли статус врал
+            st = DiagnosticsEngine.CheckAppStatus();
+            bool alreadyOk =
+                (!_settings.EnableZapret || st.ZapretRunning) &&
+                (!_settings.EnableTgWsProxy || st.TgWsProxyRunning);
 
-            AppendLog("spacer");
-            AppendLog("Всё запущено и всё работает НОРМАЛЬНО!", "final");
+            if (alreadyOk)
+            {
+                if (_settings.EnableZapret) AppendLog("Zapret уже запущен", "ok");
+                if (_settings.EnableTgWsProxy) AppendLog("tg-ws-proxy уже запущен", "ok");
 
-            StopGlow(true);
-            Dispatcher.Invoke(() => SetFixBtnConnected());
-            _discord.IsScanning = false;
-            _discord.SetAllGood(true, true);
-            AnimateProgressBar(100, Color.FromRgb(34, 197, 94), "Всё уже работает", 0.5);
-            PlaySuccessRing();
-            StopLongCheckTimer();
-            _checkInProgress = false;
-            _autoFixRunning = false;
-            FixBtn.IsEnabled = true;
-            return;
+                AppendLog("spacer");
+                AppendLog("Всё запущено и всё работает НОРМАЛЬНО!", "final");
+
+                _discord.IsScanning = false;
+                _suppressConnectedUntil = DateTime.MinValue;
+                _discord.SetAllGood(st.ZapretRunning, st.TgWsProxyRunning);
+                PlayConnectedUi("Всё уже работает");
+                _autoFixRunning = false;
+                ClearFixBusyState();
+                return;
+            }
         }
 
         bool zapretOk = !zapretNeeded;
@@ -6288,32 +6514,40 @@ public partial class MainWindow : Window
 
             if (isServiceBat)
             {
-                var cache = ZapretConfigService.LoadCache();
-                bool success = await ZapretConfigService.ApplyConfigAsync(
-                    _settings.ZapretPath, cache?.CurrentConfig ?? "");
-                zapretOk = success;
+                var cache = ZapretConfigService.LoadCache() ?? new ZapretConfigCache();
+                zapretOk = await TryStartZapretSmartAsync(cache);
             }
             else
             {
                 try
                 {
                     Process.Start(new ProcessStartInfo(_settings.ZapretPath) { UseShellExecute = true });
-                    zapretOk = true;
                 }
                 catch (Exception ex) { AppendLog($"Ошибка: {ex.Message}", "error"); }
+            }
+
+            // ждём живой winws, а не «Process.Start не кинул»
+            if (!isServiceBat || !zapretOk)
+            {
+                zapretOk = false;
+                for (int i = 0; i < 10; i++)
+                {
+                    await Task.Delay(300);
+                    if (DiagnosticsEngine.CheckAppStatus().ZapretRunning) { zapretOk = true; break; }
+                }
             }
 
             if (zapretOk) AppendLog("✓ Zapret запущен", "ok");
             else AppendLog("✗ Не удалось запустить Zapret", "error");
         }
-        else
+        else if (_settings.EnableZapret)
         {
             AppendLog("Zapret уже работает", "ok");
         }
 
         SetupProg.Value = 50;
         SetupProgLbl.Text = "TgWsProxy...";
-        await Task.Delay(300);
+        await Task.Delay(200);
 
         if (tgwsNeeded)
         {
@@ -6328,51 +6562,61 @@ public partial class MainWindow : Window
                         WindowStyle = ProcessWindowStyle.Hidden,
                     };
                     Process.Start(psi);
-                    tgwsOk = true;
-                    AppendLog("✓ TgWsProxy запущен", "ok");
                 }
                 catch (Exception ex) { AppendLog($"Ошибка: {ex.Message}", "error"); }
+
+                tgwsOk = false;
+                for (int i = 0; i < 10; i++)
+                {
+                    await Task.Delay(300);
+                    if (DiagnosticsEngine.CheckAppStatus().TgWsProxyRunning) { tgwsOk = true; break; }
+                }
+
+                if (tgwsOk) AppendLog("✓ TgWsProxy запущен", "ok");
+                else AppendLog("✗ TgWsProxy не поднялся", "error");
             }
             else
             {
                 AppendLog("Путь к TgWsProxy не указан или файл не найден", "warn");
+                tgwsOk = false;
             }
         }
-        else
+        else if (_settings.EnableTgWsProxy)
         {
             AppendLog("TgWsProxy уже работает", "ok");
         }
 
-        await Task.Delay(300);
-        AnimateProgressBar(100, Color.FromRgb(34, 197, 94), "Готово", 0.5);
-
-        StopGlow(zapretOk || tgwsOk);
         _discord.IsScanning = false;
 
         bool anySuccess = zapretOk && tgwsOk;
         if (anySuccess)
         {
-            Dispatcher.Invoke(() => SetFixBtnConnected());
-            _discord.SetAllGood(true, true);
+            _suppressConnectedUntil = DateTime.MinValue;
+            st = DiagnosticsEngine.CheckAppStatus();
+            _discord.SetAllGood(st.ZapretRunning, st.TgWsProxyRunning);
             AppendLog("spacer");
             AppendLog("Всё запущено и всё работает НОРМАЛЬНО!", "final");
-            if (zapretOk) AppendLog("Zapret включен. Discord и YouTube должны работать нормально.", "ok");
-            if (tgwsOk) AppendLog("Прокси настроен. Telegram должен работать стабильно.", "ok");
+            if (_settings.EnableZapret && st.ZapretRunning)
+                AppendLog("Zapret включен. Discord и YouTube должны работать нормально.", "ok");
+            if (_settings.EnableTgWsProxy && st.TgWsProxyRunning)
+                AppendLog("Прокси настроен. Telegram должен работать стабильно.", "ok");
             AppendLog("Если что-то всё еще не грузит, перейдите во вкладку «Частые вопросы».", "info");
-            PlaySuccessRing();
+            PlayConnectedUi("Готово");
         }
         else
         {
             _discord.SetProblems("Ошибка запуска");
+            StopGlow(false);
             AnimateProgressBar(100, Color.FromRgb(239, 68, 68), "Ошибка", 0.5);
             AppendLog("Не удалось запустить некоторые сервисы. Проверьте пути в настройках.", "error");
             PlayErrorRing();
+            PlayDisconnectedUi();
+            if (_settings.EnableZapret && !zapretOk)
+                TrackMainZapretStartFail();
         }
 
-        StopLongCheckTimer();
-        _checkInProgress = false;
         _autoFixRunning = false;
-        FixBtn.IsEnabled = true;
+        ClearFixBusyState();
     }
 
     private async Task RunAutoInstallAsync(bool preserveLists = false)
@@ -6536,21 +6780,54 @@ public partial class MainWindow : Window
         }
     }
 
-    private void StopAllBypassServices()
+    private async Task StopAllBypassServicesAsync()
     {
-        var st = DiagnosticsEngine.CheckAppStatus();
-        if (_settings.EnableZapret && st.ZapretRunning)
+        if (_settings.EnableZapret)
         {
-            foreach (var p in Process.GetProcessesByName("winws"))
-                try { p.Kill(); } catch { }
-        }
-        if (_settings.EnableTgWsProxy && st.TgWsProxyRunning)
-        {
-            foreach (var p in Process.GetProcessesByName("TgWsProxy"))
-                try { p.Kill(); } catch { }
+            AppendLog("Останавливаю Zapret…", "info");
+            ZapretConfigService.KillWinwsProcesses();
+            await AntiCheatBypassService.RunCommandAsync("sc", "stop zapret", 8000);
+            await AntiCheatBypassService.RunCommandAsync("sc", "stop windivert", 5000);
+            await AntiCheatBypassService.RunCommandAsync("sc", "stop windivert14", 5000);
         }
 
-        StopGlow(false);
+        if (_settings.EnableTgWsProxy)
+        {
+            AppendLog("Останавливаю TgWsProxy…", "info");
+            ZapretConfigService.KillTgWsProcesses();
+        }
+
+        // дожидаемся, пока процессы реально исчезнут
+        for (int i = 0; i < 8; i++)
+        {
+            var st = DiagnosticsEngine.CheckAppStatus();
+            bool zapretGone = !_settings.EnableZapret || !st.ZapretRunning;
+            bool tgGone = !_settings.EnableTgWsProxy || !st.TgWsProxyRunning;
+            if (zapretGone && tgGone) break;
+            await Task.Delay(200);
+        }
+    }
+
+    private void PlayConnectedUi(string progressLabel = "Готово")
+    {
+        StopGlow(true);
+        AnimateProgressBar(100, Color.FromRgb(34, 197, 94), progressLabel, 0.5);
+        SetFixBtnConnected();
+        PlaySuccessRing();
+    }
+
+    private void PlayDisconnectedUi()
+    {
+        _finalSuccess = true;
+        _splitTarget = 0;
+        _colorTarget = 0;
+        SpinOffset.BeginAnimation(RotateTransform.AngleProperty, null);
+        SpinRotation2.BeginAnimation(RotateTransform.AngleProperty, null);
+        FadeElementOut(SpinArc, 0.25);
+        FadeElementOut(SpinArc2, 0.25);
+        if (GetFixButtonIcon() is System.Windows.Shapes.Path iconEl)
+            iconEl.BeginAnimation(System.Windows.Shapes.Path.StrokeProperty, null);
+        SetFixBtnDisconnected();
     }
 
     private void PlayErrorRing()
@@ -6650,13 +6927,13 @@ public partial class MainWindow : Window
         }
     }
 
-    private void EnterWorkingState(string label)
+    private void EnterWorkingState(string label, string? btnLine1 = null, string? btnLine2 = null)
     {
         _isConnected = false;
         _connectedTimer?.Stop();
         _connectedTimer = null;
 
-        AnimateButtonLabel("Починить", "интернет");
+        AnimateButtonLabel(btnLine1 ?? "Починить", btnLine2 ?? "интернет");
 
         FixBtn.IsEnabled = false;
 
@@ -6707,11 +6984,15 @@ public partial class MainWindow : Window
         }
     }
 
+    private int _labelAnimGen;
+
     private void AnimateButtonLabel(string text1, string text2)
     {
         var line1 = FixBtn.Template.FindName("BtnLine1", FixBtn) as TextBlock;
         var line2 = FixBtn.Template.FindName("BtnLine2", FixBtn) as TextBlock;
         if (line1 is null || line2 is null) return;
+
+        int gen = ++_labelAnimGen; // если кликнули ещё раз — старый fade не трогает текст
 
         var dur = new Duration(TimeSpan.FromSeconds(0.2));
         var ease = new CubicEase { EasingMode = EasingMode.EaseInOut };
@@ -6719,6 +7000,7 @@ public partial class MainWindow : Window
         var fadeOut = new DoubleAnimation(1, 0, dur) { EasingFunction = ease };
         fadeOut.Completed += (_, _) =>
         {
+            if (gen != _labelAnimGen) return;
             line1.Text = text1;
             line2.Text = text2;
             line1.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(0, 1, dur) { EasingFunction = ease });
@@ -6813,36 +7095,14 @@ public partial class MainWindow : Window
                            && (!_settings.EnableTgWsProxy || st.TgWsProxyRunning);
             if (!allRunning) return;
 
-            HideAllRings();
-            AnimateSuccessArc(0.6);
-            AnimateIconColor(Color.FromRgb(0x22, 0xc5, 0x5e), 0.5);
-
-            _splitTarget = 0;
-            _colorTarget = 1;
-            _finalSuccess = true;
-
-            AnimateProgressBar(100, Color.FromRgb(0x22, 0xc5, 0x5e), "Всё уже работает", 0.6);
-            SetFixBtnConnected();
+            PlayConnectedUi("Всё уже работает");
         };
         t.Start();
     }
 
     private void SetConnectedFromStatus()
     {
-        StopSuccessRing();
-
-        AnimateProgressBar(100, Color.FromRgb(34, 197, 94), "Всё уже работает", 0.6);
-
-        HideAllRings();
-        AnimateSuccessArc(0.6);
-
-        AnimateIconColor(Color.FromRgb(0x22, 0xc5, 0x5e), 0.5);
-
-        _splitTarget = 0;
-        _colorTarget = 1;
-        _finalSuccess = true;
-
-        SetFixBtnConnected();
+        PlayConnectedUi("Всё уже работает");
     }
 
     private void UpdateConnectedTimer()
@@ -9573,6 +9833,7 @@ public partial class MainWindow : Window
         _settings.AutostartApp     = AutoAppCB.IsChecked == true;
         _settings.StartMinimizedToTray = StartMinimizedCB.IsChecked == true;
         _settings.AutoUpdates      = AutoUpdatesCB.IsChecked == true;
+        _settings.DiscordRpcEnabled = DiscordRpcCB.IsChecked == true;
         _settings.ShowGameOfferDialog  = ShowGameOfferCB.IsChecked == true;
         _settings.ShowLongCheckDialog  = ShowServiceReminderCB.IsChecked == true;
         _settings.EnableZapret = UseZapretCB.IsChecked == true;
@@ -9779,6 +10040,7 @@ public partial class MainWindow : Window
 
     private void DiscordRpcCB_Checked(object sender, RoutedEventArgs e)
     {
+        if (!_settingsLoaded) return;
         _settings.DiscordRpcEnabled = true;
         _discord.Enable();
         SettingsService.Save(_settings);
@@ -9786,9 +10048,7 @@ public partial class MainWindow : Window
 
     private void DiscordRpcCB_Unchecked(object sender, RoutedEventArgs e)
     {
-        if (!_settingsLoaded)
-            return;
-
+        if (!_settingsLoaded) return;
         _settings.DiscordRpcEnabled = false;
         _discord.Disable();
         SettingsService.Save(_settings);
@@ -14438,14 +14698,12 @@ public partial class MainWindow : Window
                 if (success)
                 {
                     CloseWizard();
-                    await Task.Delay(1500);
-                    UpdateActiveApps();
-
-                    await Task.Delay(500);
-                    FixBtn_Click(null, null);
+                    await FinishAfterZapretAppliedAsync();
                 }
                 else
                 {
+                    AppendLog("Не удалось применить конфиг Zapret.", "error");
+                    ClearFixBusyState();
                 }
             }
         });
@@ -14594,7 +14852,7 @@ public partial class MainWindow : Window
                     var st = DiagnosticsEngine.CheckAppStatus();
                     if (!st.TgWsProxyRunning) StartTgWsProxyWithActivation();
                     CloseWizard();
-                    RunAutoFix();
+                    if (!_autoFixRunning) RunAutoFix();
                 });
                 break;
             case 11:
@@ -14603,7 +14861,7 @@ public partial class MainWindow : Window
                     var st = DiagnosticsEngine.CheckAppStatus();
                     if (!st.TgWsProxyRunning) StartTgWsProxyWithActivation();
                     CloseWizard();
-                    RunAutoFix();
+                    if (!_autoFixRunning) RunAutoFix();
                 });
                 break;
         }
@@ -14631,15 +14889,18 @@ public partial class MainWindow : Window
         }
     }
 
-    private void StartZapretProcess()
+    private async Task StartZapretProcessAsync()
     {
         try
         {
-            Process.Start(new ProcessStartInfo(_settings.ZapretPath)
-            {
-                UseShellExecute = true,
-                WorkingDirectory = System.IO.Path.GetDirectoryName(_settings.ZapretPath)
-            });
+            if (string.IsNullOrEmpty(_settings.ZapretPath) || !File.Exists(_settings.ZapretPath))
+                return;
+
+            var cache = ZapretConfigService.LoadCache();
+            if (cache is null || string.IsNullOrEmpty(cache.CurrentConfig))
+                return;
+
+            await ZapretConfigService.ApplyConfigAsync(_settings.ZapretPath, cache.CurrentConfig);
         }
         catch
         {
@@ -16594,25 +16855,15 @@ public partial class MainWindow : Window
 
             if (enable)
             {
-                var psi = new ProcessStartInfo("schtasks.exe",
-                    $"/create /tn \"{taskName}\" /tr \"\\\"{path}\\\" --autostart\" /sc onlogon /rl highest /f")
-                {
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-                using var proc = Process.Start(psi);
-                proc?.WaitForExit();
+                ProcessRunner.Run("schtasks.exe",
+                    $"/create /tn \"{taskName}\" /tr \"\\\"{path}\\\" --autostart\" /sc onlogon /rl highest /f",
+                    8000);
             }
             else
             {
-                var psi = new ProcessStartInfo("schtasks.exe",
-                    $"/delete /tn \"{taskName}\" /f")
-                {
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-                using var proc = Process.Start(psi);
-                proc?.WaitForExit();
+                ProcessRunner.Run("schtasks.exe",
+                    $"/delete /tn \"{taskName}\" /f",
+                    8000);
             }
 
             try
@@ -17989,31 +18240,17 @@ public partial class MainWindow : Window
 
         try
         {
-            foreach (var p in Process.GetProcessesByName("winws"))
-                try { p.Kill(); } catch { }
-            foreach (var p in Process.GetProcessesByName("winws.exe"))
-                try { p.Kill(); } catch { }
+            ZapretConfigService.KillWinwsProcesses();
 
-            try
-            {
-                var stopPsi = new ProcessStartInfo
-                {
-                    FileName = "net.exe",
-                    Arguments = "stop zapret",
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-                using var stopProc = Process.Start(stopPsi);
-                if (stopProc != null) await stopProc.WaitForExitAsync();
-            }
-            catch { }
-
-            await Task.Delay(500);
+            await ProcessRunner.RunAsync("sc", "stop zapret", 8000);
+            await Task.Delay(400);
 
             var cache = ZapretConfigService.LoadCache();
             if (cache is not null && !string.IsNullOrEmpty(cache.CurrentConfig) && !string.IsNullOrEmpty(_settings.ZapretPath))
             {
-                await ZapretConfigService.ApplyConfigAsync(_settings.ZapretPath, cache.CurrentConfig);
+                bool ok = await ZapretConfigService.ApplyConfigAsync(_settings.ZapretPath, cache.CurrentConfig);
+                if (!ok)
+                    AppendLog("Не удалось перезапустить Zapret после смены опций", "warn");
             }
 
             await Task.Delay(1500);
@@ -19828,33 +20065,17 @@ public partial class MainWindow : Window
                 "Get-DnsClientDohServerAddress -ErrorAction SilentlyContinue | Remove-DnsClientDohServerAddress -ErrorAction SilentlyContinue; " +
                 "Clear-DnsClientCache";
 
-            var psi = new ProcessStartInfo
+            var (exitCode, stdErr) = await ProcessRunner.RunAsync(
+                "powershell",
+                $"-NoProfile -ExecutionPolicy Bypass -Command \"{psCommand}\"",
+                20000);
+
+            if (exitCode != 0)
             {
-                FileName = "powershell",
-                Arguments = $"-NoProfile -ExecutionPolicy Bypass -Command \"{psCommand}\"",
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-
-            using var process = Process.Start(psi);
-            if (process is not null)
-            {
-                var stdErrTask = process.StandardError.ReadToEndAsync();
-                var stdOutTask = process.StandardOutput.ReadToEndAsync();
-
-                await process.WaitForExitAsync();
-                var stdErr = await stdErrTask;
-                var stdOut = await stdOutTask;
-
-                if (process.ExitCode != 0)
-                {
-                    Dispatcher.Invoke(() => ShowNotification("Ошибка сброса", $"Не удалось сбросить настройки DNS (код {process.ExitCode}): {stdErr}", true));
-                    return false;
-                }
-                return true;
+                Dispatcher.Invoke(() => ShowNotification("Ошибка сброса", $"Не удалось сбросить настройки DNS (код {exitCode}): {stdErr}", true));
+                return false;
             }
+            return true;
         }
         catch (Exception ex)
         {
@@ -19920,33 +20141,17 @@ public partial class MainWindow : Window
                 psCommand += $"; Clear-DnsClientCache";
             }
 
-            var psi = new ProcessStartInfo
+            var (exitCode, stdErr) = await ProcessRunner.RunAsync(
+                "powershell",
+                $"-NoProfile -ExecutionPolicy Bypass -Command \"{psCommand}\"",
+                20000);
+
+            if (exitCode != 0)
             {
-                FileName = "powershell",
-                Arguments = $"-NoProfile -ExecutionPolicy Bypass -Command \"{psCommand}\"",
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-
-            using var process = Process.Start(psi);
-            if (process is not null)
-            {
-                var stdErrTask = process.StandardError.ReadToEndAsync();
-                var stdOutTask = process.StandardOutput.ReadToEndAsync();
-
-                await process.WaitForExitAsync();
-                var stdErr = await stdErrTask;
-                var stdOut = await stdOutTask;
-
-                if (process.ExitCode != 0)
-                {
-                    Dispatcher.Invoke(() => ShowNotification("Ошибка", $"Ошибка при настройке DNS (код {process.ExitCode}): {stdErr}", true));
-                    return false;
-                }
-                return true;
+                Dispatcher.Invoke(() => ShowNotification("Ошибка", $"Ошибка при настройке DNS (код {exitCode}): {stdErr}", true));
+                return false;
             }
+            return true;
         }
         catch (Exception ex)
         {

@@ -965,7 +965,6 @@ public static class ConnectionAnalysisService
         try
         {
             if (Process.GetProcessesByName("winws").Length > 0) return true;
-            if (Process.GetProcessesByName("windivert").Length > 0) return true;
             if (Process.GetProcessesByName("nfqws").Length > 0) return true;
         }
         catch { }
@@ -1015,11 +1014,22 @@ public static class ConnectionAnalysisService
                 string desc = nic.Description;
                 string name = nic.Name;
 
-                bool isVpn = VpnKeywords.Any(k => desc.Contains(k, StringComparison.OrdinalIgnoreCase) ||
-                                                  name.Contains(k, StringComparison.OrdinalIgnoreCase));
+                bool isExcludedVirtual = VirtualKeywords.Any(k =>
+                    desc.Contains(k, StringComparison.OrdinalIgnoreCase) ||
+                    name.Contains(k, StringComparison.OrdinalIgnoreCase));
 
-                bool isVirtual = !isVpn && VirtualKeywords.Any(k => desc.Contains(k, StringComparison.OrdinalIgnoreCase) ||
-                                                                   name.Contains(k, StringComparison.OrdinalIgnoreCase));
+                bool isTunnelType = nic.NetworkInterfaceType is NetworkInterfaceType.Ppp
+                    or NetworkInterfaceType.Tunnel;
+
+                // VPN: либо по имени, либо дефолтный выход через туннель (не hyper-v/docker)
+                bool isVpnByName = VpnKeywords.Any(k =>
+                    desc.Contains(k, StringComparison.OrdinalIgnoreCase) ||
+                    name.Contains(k, StringComparison.OrdinalIgnoreCase));
+
+                bool isDefaultEgress = ifIndex == defaultIfIndex && defaultIfIndex > 0;
+                bool isVpn = !isExcludedVirtual && (isVpnByName || (isTunnelType && isDefaultEgress));
+
+                bool isVirtual = !isVpn && isExcludedVirtual;
 
                 string type;
                 if (isVpn)

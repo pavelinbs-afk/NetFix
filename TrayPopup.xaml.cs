@@ -373,8 +373,9 @@ public partial class TrayPopup : Window
         var running = DiagnosticsEngine.CheckAppStatus().ZapretRunning;
         if (running)
         {
-            foreach (var p in Process.GetProcessesByName("winws")) try { p.Kill(); } catch { }
-            await Task.Delay(500);
+            ZapretConfigService.KillWinwsProcesses();
+            await ProcessRunner.RunAsync("sc", "stop zapret", 5000);
+            await Task.Delay(400);
         }
         else
         {
@@ -384,10 +385,8 @@ public partial class TrayPopup : Window
                 var cache = ZapretConfigService.LoadCache();
                 if (cache?.CurrentConfig is { Length: > 0 })
                     await ZapretConfigService.ApplyConfigAsync(settings.ZapretPath, cache.CurrentConfig);
-                else
-                    Process.Start(new ProcessStartInfo("cmd.exe", $"/c \"{settings.ZapretPath}\"") { UseShellExecute = false, CreateNoWindow = true });
             }
-            await Task.Delay(1000);
+            await Task.Delay(600);
         }
 
         UpdateStatus();
@@ -402,15 +401,15 @@ public partial class TrayPopup : Window
         var running = DiagnosticsEngine.CheckAppStatus().TgWsProxyRunning;
         if (running)
         {
-            foreach (var p in Process.GetProcessesByName("TgWsProxy")) try { p.Kill(); } catch { }
-            await Task.Delay(500);
+            ZapretConfigService.KillTgWsProcesses();
+            await Task.Delay(400);
         }
         else
         {
             var settings = SettingsService.Load();
             if (!string.IsNullOrEmpty(settings.TgWsProxyPath) && System.IO.File.Exists(settings.TgWsProxyPath))
                 Process.Start(new ProcessStartInfo(settings.TgWsProxyPath) { UseShellExecute = true });
-            await Task.Delay(1000);
+            await Task.Delay(800);
         }
 
         UpdateStatus();

@@ -6530,9 +6530,12 @@
                                 <TextBlock Text="ПРОЧЕЕ" FontFamily="Segoe UI" FontSize="11"
                                            Foreground="#888888" FontWeight="Bold" Margin="0,0,0,12"/>
                                 <CheckBox x:Name="DiscordRpcCB" Style="{StaticResource Toggle}"
-                                          Content="Интеграция с Discord" Margin="0,0,0,10"
+                                          Content="Статус в Discord" Margin="0,0,0,4"
                                           Checked="DiscordRpcCB_Checked"
                                           Unchecked="DiscordRpcCB_Unchecked"/>
+                                <TextBlock Text="Показывает, чем занят NetFix, у тебя в профиле Discord. Можно выключить."
+                                           FontSize="10.5" Foreground="#888888" TextWrapping="Wrap"
+                                           Margin="0,0,0,10"/>
                                 <CheckBox x:Name="AutoUpdatesCB" Style="{StaticResource Toggle}"
                                           Content="Автоматические обновления" Margin="0,0,0,10"
                                           Checked="SettingCB_Checked" Unchecked="SettingCB_Unchecked"/>

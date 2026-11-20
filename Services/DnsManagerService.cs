@@ -166,7 +166,7 @@ public static class DnsManagerService
                 return false;
             }
 
-            // в одинарных кавычках PS апостроф экранируется удвоением
+            // в PS одинарная кавычка экранируется удвоением: ' → ''
             string Q(string v) => (v ?? "").Replace("'", "''");
 
             string interfaceName = Q(activeInterface.Name);
@@ -212,23 +212,11 @@ public static class DnsManagerService
                 psCommand += $"; Clear-DnsClientCache";
             }
 
-            var psi = new ProcessStartInfo
-            {
-                FileName = "powershell",
-                Arguments = $"-NoProfile -ExecutionPolicy Bypass -Command \"{psCommand}\"",
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-
-            using var process = Process.Start(psi);
-            if (process is not null)
-            {
-                await process.WaitForExitAsync();
-                return process.ExitCode == 0;
-            }
-            return false;
+            var (exitCode, _) = await ProcessRunner.RunAsync(
+                "powershell",
+                $"-NoProfile -ExecutionPolicy Bypass -Command \"{psCommand}\"",
+                20000).ConfigureAwait(false);
+            return exitCode == 0;
         }
         catch
         {
